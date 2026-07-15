@@ -1,0 +1,45 @@
+{
+    "git.ignoreLimitWarning": true,
+    "files.autoSave": "afterDelay",
+    "php.suggest.basic": false,
+    "php.validate.enable": false,
+    "intelephense.environment.phpVersion": "8.2",
+    "intelephense.files.maxSize": 5000000,
+    "intelephense.files.exclude": [
+        "**/vendor/**",
+        "**/Assets/**",
+        "**/node_modules/**"
+    ],
+    "[php]": {
+        "editor.defaultFormatter": "DEVSENSE.phptools-vscode",
+        "editor.formatOnSave": false
+    },
+    "dbcode.connections": [
+        {
+            "connectionId": "Ml5BSKY0MQwXSk4D_sXCB",
+            "name": "SnuQualityDataStored",
+            "driver": "mysql",
+            "color": "#00E3A9",
+            "connectionType": "host",
+            "host": "semidedi-40.banahosting.com",
+            "port": 3306,
+            "ssl": false,
+            "username": "fugzcdpo_Vscode",
+            "password": "",
+            "savePassword": "secretStorage",
+            "database": "fugzcdpo_SoftwareEinnovacionGoogleDrive",
+            "readOnly": false,
+            "role": "testing",
+            "postConnectionSqlType": "inline",
+            "connectionTimeout": 30,
+            "pinnedConnectionTimeout": "0",
+            "driverOptions": {
+                "retrievePublickey": true,
+                "disableMultiStatements": false
+            },
+            "introspection": {
+                "progressive": false
+            }
+        }
+    ]
+}
