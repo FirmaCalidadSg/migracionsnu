@@ -767,6 +767,7 @@
             document.getElementById('active-sync-panel').scrollIntoView({ behavior: 'smooth' });
 
             appendTerminal(`Iniciando sincronización para ${cliente.nombre}...`, 'info');
+            appendTerminal(`Validando existencia y permisos de base de datos destino (\`${cliente.schema}\`)...`, 'info');
 
             // 1. Iniciar Job
             fetch(`index.php?action=iniciar_job&cliente_id=${cliente.id}`)
@@ -779,6 +780,7 @@
                     const jobId = res.job_id;
                     const tablas = res.tablas;
                     
+                    appendTerminal(`Base de datos de destino verificada y lista para migración.`, 'info');
                     appendTerminal(`Job de sincronización #${jobId} creado con éxito.`, 'info');
                     appendTerminal(`Detectadas ${tablas.length} tablas para migración.`, 'info');
 

@@ -24,8 +24,10 @@ return [
     'destino' => [
         'prefix' => 'fugzcdpo_',
         'name' => 'snu', // <-- Nombre real de la base de datos en destino (producción)
-        'user' => 'fugzcdpo_snu', // Tu usuario de destino
+        'user' => 'fugzcdpo_snu', // Tu usuario de destino para operaciones normales
         'password' => 'ntcAmZBoSB0rEgEfxn3gbEoA7', // Tu contraseña de destino
+        'admin_user' => 'root', // Usuario con acceso total para crear bases de datos y asignar permisos
+        'admin_password' => 'cbyxbI7P8Cxoy1kp', // Contraseña de root en MySQL
         'host' => '127.0.0.1', // O localhost, ya que el destino es local al script
         'charset' => 'utf8mb4'
     ]

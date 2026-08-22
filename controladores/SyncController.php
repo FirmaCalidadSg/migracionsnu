@@ -61,7 +61,10 @@ class SyncController {
             $schema = $clienteActual['schema'];
             $nombreCliente = $clienteActual['nombre'];
 
-            // 2. Conectarse a origen para obtener las tablas
+            // 2. VALIDAR Y ASEGURAR QUE LA BASE DE DATOS DE DESTINO EXISTE Y ES ACCESIBLE ANTES DE PROSEGUIR
+            Database::ensureClientDatabaseExists($schema, 'destino');
+
+            // 3. Conectarse a origen para obtener las tablas
             $dbOrigen = Database::getClienteConnection($schema, 'origen');
             $stmtTablas = $dbOrigen->query("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'");
             $tablas = [];
