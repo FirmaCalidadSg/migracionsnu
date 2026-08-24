@@ -65,6 +65,12 @@ try {
         case 'sincronizar_catalogo':
             $controller->sincronizarCatalogo();
             break;
+        case 'aprovisionar_cliente':
+            $controller->aprovisionarCliente();
+            break;
+        case 'asociar_virtualmin':
+            $controller->asociarVirtualmin();
+            break;
         default:
             header("HTTP/1.0 404 Not Found");
             echo "Acción no encontrada.";

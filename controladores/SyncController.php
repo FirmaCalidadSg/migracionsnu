@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/../modelos/Database.php';
 require_once __DIR__ . '/../modelos/SyncModel.php';
+require_once __DIR__ . '/../modelos/DatabaseProvisioningService.php';
 
 class SyncController {
 
@@ -470,9 +471,16 @@ class SyncController {
             // 3. Replicar los registros de la tabla 'squemas'
             $this->replicarTablaCatalogo($dbOrigen, $dbDestino, 'squemas');
 
-            echo json_encode(['success' => true, 'mensaje' => 'Catálogo de clientes y esquemas sincronizado con éxito.']);
+            // 4. Sincronizar y asociar catálogo de bases de clientes MariaDB con Virtualmin (NO crea bases, solo asocia existentes)
+            $resSync = DatabaseProvisioningService::syncDatabaseCatalog('snuquality.tech', 'fugzcdpo_snu');
+
+            echo json_encode($resSync);
         } catch (Exception $e) {
-            echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+            echo json_encode([
+                'success' => false,
+                'status' => 'error',
+                'error' => $e->getMessage()
+            ]);
         }
     }
 
@@ -560,6 +568,50 @@ class SyncController {
             }
         } catch (Exception $e) {
             echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+        }
+    }
+
+    /**
+     * Aprovisiona la base de datos de un cliente (física + permisos + Virtualmin).
+     */
+    public function aprovisionarCliente(): void {
+        header('Content-Type: application/json');
+        try {
+            $schema = $_POST['schema'] ?? $_GET['schema'] ?? '';
+            if (empty($schema)) {
+                throw new Exception("El nombre del esquema (cliente) es requerido.");
+            }
+
+            $resultado = DatabaseProvisioningService::provisionDatabase($schema);
+            echo json_encode($resultado);
+        } catch (Exception $e) {
+            echo json_encode([
+                'success' => false,
+                'status' => DatabaseProvisioningService::STATE_ERROR,
+                'message' => $e->getMessage()
+            ]);
+        }
+    }
+
+    /**
+     * Asocia una base de datos existente con Virtualmin.
+     */
+    public function asociarVirtualmin(): void {
+        header('Content-Type: application/json');
+        try {
+            $database = $_POST['database'] ?? $_GET['database'] ?? '';
+            if (empty($database)) {
+                throw new Exception("El nombre de la base de datos es requerido.");
+            }
+
+            $resultado = DatabaseProvisioningService::associateWithVirtualmin($database);
+            echo json_encode($resultado);
+        } catch (Exception $e) {
+            echo json_encode([
+                'success' => false,
+                'status' => DatabaseProvisioningService::STATE_ERROR,
+                'message' => $e->getMessage()
+            ]);
         }
     }
 

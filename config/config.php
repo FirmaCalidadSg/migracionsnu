@@ -29,6 +29,11 @@ return [
         'admin_user' => 'root', // Usuario con acceso total para crear bases de datos y asignar permisos
         'admin_password' => 'cbyxbI7P8Cxoy1kp', // Contraseña de root en MySQL
         'host' => '127.0.0.1', // O localhost, ya que el destino es local al script
-        'charset' => 'utf8mb4'
+        'charset' => 'utf8mb4',
+        'virtualmin' => [
+            'enabled' => true,
+            'domain' => 'snuquality.tech',
+            'command' => 'sudo /usr/sbin/virtualmin'
+        ]
     ]
 ];

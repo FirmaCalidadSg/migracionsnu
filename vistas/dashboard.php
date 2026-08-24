@@ -533,6 +533,27 @@
         </div>
     </div>
 
+    <!-- Modal Resultado Sincronización de Catálogo -->
+    <div class="modal fade" id="catalogSyncResultModal" tabindex="-1" aria-labelledby="catalogSyncResultModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-lg modal-dialog-centered">
+            <div class="modal-content modal-content-premium">
+                <div class="modal-header modal-header-premium">
+                    <h5 class="modal-title d-flex align-items-center gap-2" id="catalogSyncResultModalLabel">
+                        <i class="bi bi-cloud-check text-primary"></i>
+                        <span>Resultado de Sincronización de Catálogo</span>
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body p-4" id="catalog-sync-modal-body">
+                    <!-- Contenido dinámico -->
+                </div>
+                <div class="modal-footer modal-footer-premium">
+                    <button type="button" class="btn btn-secondary-custom" data-bs-dismiss="modal">Cerrar</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Bootstrap 5 JS Bundle via CDN -->
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 
@@ -938,25 +959,105 @@
             
             // Cambiar texto de carga en el botón
             const originalHtml = btnSync.innerHTML;
-            btnSync.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span> Sincronizando...';
+            btnSync.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span> Sincronizando Catálogo...';
 
             fetch('index.php?action=sincronizar_catalogo')
                 .then(response => response.json())
                 .then(res => {
-                    if (res.success) {
-                        alert(res.mensaje || 'Catálogo sincronizado correctamente.');
-                    } else {
-                        alert('Error al sincronizar el catálogo: ' + res.error);
-                    }
+                    mostrarResultadoSincronizacionCatalogo(res);
                 })
                 .catch(err => {
-                    alert('Error de conexión: ' + err);
+                    alert('Error de comunicación con el servidor: ' + err);
                 })
                 .finally(() => {
                     // Restaurar botones y recargar listado
                     btnSync.innerHTML = originalHtml;
                     finalizarFlujoUI();
                 });
+        }
+
+        // Renderizar el resumen estructurado de la sincronización de catálogo
+        function mostrarResultadoSincronizacionCatalogo(res) {
+            const container = document.getElementById('catalog-sync-modal-body');
+            const isSuccess = (res.success === true) || (res.status === 'completed');
+            const statusClass = isSuccess ? 'text-success' : 'text-warning';
+            const statusIcon = isSuccess ? 'bi-check-circle-fill text-success' : 'bi-exclamation-triangle-fill text-warning';
+            const statusTitle = isSuccess ? '✓ Catálogo sincronizado correctamente' : '⚠ Sincronización con observaciones';
+
+            let html = `
+                <div class="card p-3 mb-4" style="background: rgba(255,255,255,0.03); border: 1px solid var(--border-glass); border-radius: 12px;">
+                    <div class="d-flex align-items-center gap-3 mb-3">
+                        <i class="bi ${statusIcon}" style="font-size: 2rem;"></i>
+                        <div>
+                            <h6 class="mb-1 fw-bold ${statusClass}">${statusTitle}</h6>
+                            <small class="text-muted">${res.message || res.error || ''}</small>
+                        </div>
+                    </div>
+                    <div class="row g-3 text-center">
+                        <div class="col-6 col-md-3">
+                            <div class="p-2" style="background: rgba(0,0,0,0.2); border-radius: 8px;">
+                                <div class="text-muted" style="font-size: 0.75rem;">Bases en MariaDB</div>
+                                <div class="fw-bold fs-5 text-white">${res.total_mariadb ?? 0}</div>
+                            </div>
+                        </div>
+                        <div class="col-6 col-md-3">
+                            <div class="p-2" style="background: rgba(0,0,0,0.2); border-radius: 8px;">
+                                <div class="text-muted" style="font-size: 0.75rem;">Ya Asociadas</div>
+                                <div class="fw-bold fs-5 text-info">${res.already_synced ?? 0}</div>
+                            </div>
+                        </div>
+                        <div class="col-6 col-md-3">
+                            <div class="p-2" style="background: rgba(0,0,0,0.2); border-radius: 8px;">
+                                <div class="text-muted" style="font-size: 0.75rem;">Asociadas Ahora</div>
+                                <div class="fw-bold fs-5 text-success">${res.associated ?? 0}</div>
+                            </div>
+                        </div>
+                        <div class="col-6 col-md-3">
+                            <div class="p-2" style="background: rgba(0,0,0,0.2); border-radius: 8px;">
+                                <div class="text-muted" style="font-size: 0.75rem;">Pendientes / Errores</div>
+                                <div class="fw-bold fs-5 ${(res.pending > 0 || res.failed > 0) ? 'text-danger' : 'text-muted'}">${(res.pending ?? 0) + (res.failed ?? 0)}</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            if (res.virtualmin_diagnostics && res.virtualmin_diagnostics.exit_code !== 0 && res.virtualmin_diagnostics.error) {
+                html += `
+                    <div class="alert alert-warning mb-3" style="background: rgba(234, 179, 8, 0.1); border-color: rgba(234, 179, 8, 0.3); color: #fde047; font-size: 0.85rem;">
+                        <i class="bi bi-shield-exclamation me-1"></i> <strong>Diagnóstico Virtualmin CLI:</strong>
+                        <div class="mt-1"><code>${res.virtualmin_diagnostics.command || ''}</code></div>
+                        <div class="mt-1 text-muted" style="color: #cbd5e1 !important;">Salida: ${res.virtualmin_diagnostics.error}</div>
+                        ${res.virtualmin_diagnostics.causa_probable ? `<div class="mt-1"><strong>Causa probable:</strong> ${res.virtualmin_diagnostics.causa_probable}</div>` : ''}
+                    </div>
+                `;
+            }
+
+            if (res.bases_asociadas_ahora && res.bases_asociadas_ahora.length > 0) {
+                html += `
+                    <div class="mb-3">
+                        <label class="form-label text-success fw-semibold" style="font-size: 0.85rem;"><i class="bi bi-plus-circle me-1"></i> Bases asociadas en esta ejecución (${res.bases_asociadas_ahora.length}):</label>
+                        <div class="p-2" style="max-height: 120px; overflow-y: auto; background: rgba(0,0,0,0.3); border-radius: 8px; font-family: monospace; font-size: 0.8rem;">
+                            ${res.bases_asociadas_ahora.join(', ')}
+                        </div>
+                    </div>
+                `;
+            }
+
+            if (res.bases_pendientes && res.bases_pendientes.length > 0) {
+                html += `
+                    <div class="mb-3">
+                        <label class="form-label text-warning fw-semibold" style="font-size: 0.85rem;"><i class="bi bi-clock-history me-1"></i> Bases pendientes de asociación (${res.bases_pendientes.length}):</label>
+                        <div class="p-2" style="max-height: 120px; overflow-y: auto; background: rgba(0,0,0,0.3); border-radius: 8px; font-family: monospace; font-size: 0.8rem; color: #fef08a;">
+                            ${res.bases_pendientes.join(', ')}
+                        </div>
+                    </div>
+                `;
+            }
+
+            container.innerHTML = html;
+            const modal = new bootstrap.Modal(document.getElementById('catalogSyncResultModal'));
+            modal.show();
         }
 
         // ==========================================
