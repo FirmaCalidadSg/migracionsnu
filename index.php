@@ -13,15 +13,17 @@ if (session_status() === PHP_SESSION_NONE) {
 }
 
 require_once __DIR__ . '/controladores/SyncController.php';
+require_once __DIR__ . '/controladores/BackupController.php';
 
 $action = $_GET['action'] ?? $_POST['action'] ?? 'index';
 $controller = new SyncController();
+$backupController = new BackupController();
 
 // Lógica de autorización
 $sesionActiva = isset($_SESSION['migrador_user']);
 
 if (!$sesionActiva && $action !== 'login') {
-    if ($action === 'index') {
+    if ($action === 'index' || $action === 'backup_index') {
         // Cargar la vista del login si no hay sesión
         require_once __DIR__ . '/vistas/login.php';
         exit;
@@ -71,6 +73,27 @@ try {
         case 'asociar_virtualmin':
             $controller->asociarVirtualmin();
             break;
+
+        // MÓDULO INDEPENDIENTE DE BACKUPS DE BASES DE DATOS
+        case 'backup_index':
+            $backupController->index();
+            break;
+        case 'backup_get_status':
+            $backupController->getStatus();
+            break;
+        case 'backup_start':
+            $backupController->start();
+            break;
+        case 'backup_poll':
+            $backupController->poll();
+            break;
+        case 'backup_download':
+            $backupController->download();
+            break;
+        case 'backup_delete':
+            $backupController->delete();
+            break;
+
         default:
             header("HTTP/1.0 404 Not Found");
             echo "Acción no encontrada.";

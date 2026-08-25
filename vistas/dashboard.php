@@ -22,11 +22,15 @@
             --accent-primary: #6366f1; /* Indigo */
             --accent-secondary: #06b6d4; /* Cian */
             --accent-violet: #8b5cf6; /* Violeta */
-            --text-main: #f3f4f6;
-            --text-muted: #9ca3af;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
             --success: #10b981;
             --warning: #f59e0b;
             --danger: #ef4444;
+        }
+
+        .text-muted {
+            color: #94a3b8 !important;
         }
 
         body {
@@ -74,6 +78,30 @@
             display: flex;
             align-items: center;
             gap: 10px;
+            text-decoration: none;
+        }
+
+        /* Nav Pills Modern */
+        .nav-link-custom {
+            color: var(--text-muted);
+            border-radius: 10px;
+            padding: 8px 16px;
+            font-weight: 500;
+            font-size: 0.9rem;
+            transition: all 0.2s;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .nav-link-custom:hover {
+            color: var(--text-main);
+            background: rgba(255, 255, 255, 0.05);
+        }
+        .nav-link-custom.active {
+            color: #fff;
+            background: linear-gradient(135deg, rgba(99, 102, 241, 0.3), rgba(6, 182, 212, 0.3));
+            border: 1px solid rgba(99, 102, 241, 0.4);
         }
 
         /* KPI Cards */
@@ -337,10 +365,22 @@
     <!-- Navegación Premium -->
     <nav class="navbar navbar-premium sticky-top">
         <div class="container">
-            <a class="navbar-brand navbar-brand-premium" href="#">
-                <i class="bi bi-arrow-repeat rotate-icon" style="font-size: 1.7rem;"></i>
-                <span>SNU QUALITY MIGRATOR</span>
-            </a>
+            <div class="d-flex align-items-center gap-4">
+                <a class="navbar-brand navbar-brand-premium" href="index.php?action=index">
+                    <i class="bi bi-arrow-repeat rotate-icon" style="font-size: 1.7rem;"></i>
+                    <span>SNU QUALITY MIGRATOR</span>
+                </a>
+
+                <div class="d-none d-md-flex align-items-center gap-2">
+                    <a href="index.php?action=index" class="nav-link-custom active">
+                        <i class="bi bi-arrow-repeat"></i> Sincronizador
+                    </a>
+                    <a href="index.php?action=backup_index" class="nav-link-custom">
+                        <i class="bi bi-archive-fill"></i> Copias de Seguridad
+                    </a>
+                </div>
+            </div>
+
             <div class="d-flex align-items-center gap-4">
                 <div class="d-flex align-items-center gap-2">
                     <span class="d-inline-block rounded-circle bg-success" style="width: 8px; height: 8px; animation: pulse-active 1.5s infinite;"></span>
