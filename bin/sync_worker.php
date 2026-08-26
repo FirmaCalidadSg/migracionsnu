@@ -1,0 +1,361 @@
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Worker CLI de Sincronización Automática con Detección de Cambios por Metadatos.
+ * 
+ * Evalúa las bases de datos origen y omite la sincronización si la firma (metadata_signature)
+ * no ha cambiado desde la última sincronización exitosa registrada.
+ * Excluye expresamente la tabla 'estadisticasUso' de la firmas y del proceso de sincronización.
+ */
+
+if (php_sapi_name() !== 'cli' && !defined('SYNC_WORKER_ALLOW_HTTP')) {
+    if (session_status() === PHP_SESSION_NONE) {
+        session_start();
+    }
+    if (!isset($_SESSION['migrador_user'])) {
+        header('HTTP/1.0 403 Forbidden');
+        echo "Acceso denegado.";
+        exit;
+    }
+}
+
+set_time_limit(0);
+ini_set('memory_limit', '1024M');
+ignore_user_abort(true);
+
+require_once dirname(__DIR__) . '/modelos/Database.php';
+require_once dirname(__DIR__) . '/modelos/SyncModel.php';
+require_once dirname(__DIR__) . '/modelos/DatabaseMetadataService.php';
+require_once dirname(__DIR__) . '/modelos/BackupService.php';
+
+function runAutomaticSync(string $triggerType = 'cron'): array {
+    $startTime = microtime(true);
+    echo "======================================================================\n";
+    echo "  INICIANDO SINCRONIZACIÓN AUTOMÁTICA DE BASES DE DATOS (SNU QUALITY)\n";
+    echo "======================================================================\n";
+    echo "Fecha de Inicio: " . date('Y-m-d H:i:s') . "\n";
+    echo "Tabla excluida del proceso y firmas: " . implode(', ', DatabaseMetadataService::EXCLUDED_TABLES) . "\n\n";
+
+    try {
+        $origenConnMain = Database::getOrigenConnection();
+    } catch (Exception $eOrig) {
+        $origenConnMain = null;
+    }
+
+    try {
+        $destinoConnMain = Database::getDestinoConnection();
+    } catch (Exception $eDest) {
+        echo "ERROR: No se pudo conectar a la base de datos de destino: " . $eDest->getMessage() . "\n";
+        return ['success' => false, 'error' => $eDest->getMessage()];
+    }
+
+    // 1. Descubrir bases de datos a procesar alineado con el Mapeo de Clientes (Fase 1)
+    $databases = [];
+    try {
+        $clientesMap = SyncModel::getClientesMap();
+        foreach ($clientesMap as $c) {
+            if (empty($c['schema'])) {
+                continue;
+            }
+            // Incluir si el estado de validación es OK o si solo requiere aprovisionamiento en destino
+            if ($c['status'] === SyncModel::STATUS_OK || $c['status'] === SyncModel::STATUS_ERROR_DB_PHYSICAL_DESTINO) {
+                $dbName = Database::getDatabaseName('origen', $c['schema']);
+                $databases[] = trim($dbName);
+            }
+        }
+    } catch (Exception $exMap) {}
+
+    // Fallback: Si no se pudo obtener del mapeo de clientes, usar descubrimiento dinámico
+    if (empty($databases)) {
+        if ($origenConnMain) {
+            try {
+                $stmtDisc = $origenConnMain->query("
+                    SELECT LOWER(SCHEMA_NAME) AS db_name 
+                    FROM INFORMATION_SCHEMA.SCHEMATA 
+                    WHERE LOWER(SCHEMA_NAME) LIKE 'fugzcdpo_%'
+                    ORDER BY SCHEMA_NAME ASC
+                ");
+                $rowsDisc = $stmtDisc->fetchAll(PDO::FETCH_COLUMN);
+                $systemDbs = ['information_schema', 'mysql', 'performance_schema', 'sys', 'snuquality', 'snuqualityapp', 'snuqualityapp_wordpress'];
+                foreach ($rowsDisc as $r) {
+                    $db = strtolower(trim($r));
+                    if (!in_array($db, $systemDbs, true) && preg_match('/^fugzcdpo_[a-zA-Z0-9_]+$/', $db)) {
+                        $databases[] = $db;
+                    }
+                }
+            } catch (Exception $exDisc) {}
+        }
+        if (empty($databases)) {
+            $databases = BackupService::getDatabasesToBackup();
+        }
+    }
+
+    $databases = array_values(array_unique($databases));
+    $totalDatabases = count($databases);
+
+    echo "Total de bases de datos detectadas: $totalDatabases\n\n";
+
+    if ($totalDatabases === 0) {
+        echo "No se encontraron bases de datos para sincronizar.\n";
+        return ['success' => true, 'total' => 0];
+    }
+
+    // 2. Registrar inicio de ejecución global en database_sync_runs
+    $runId = SyncModel::createDatabaseSyncRun($triggerType, $totalDatabases);
+
+    $processedCount = 0;
+    $successfulCount = 0;
+    $failedCount = 0;
+    $skippedCount = 0;
+
+    $heaviestSynced = ['name' => null, 'size' => 0];
+    $slowestSynced = ['name' => null, 'duration' => 0];
+    $fastestSynced = ['name' => null, 'duration' => PHP_INT_MAX];
+    $syncDurations = [];
+
+    foreach ($databases as $index => $dbName) {
+        $num = $index + 1;
+        $processedCount++;
+        echo sprintf("[%d/%d] Evaluando base de datos: %s...\n", $num, $totalDatabases, $dbName);
+
+        // Obtener conexión específica a la base en Origen y Destino si existen
+        try {
+            $origenPdo = Database::getClienteConnection($dbName, 'origen');
+        } catch (Exception $eConn) {
+            echo sprintf("  -> ERROR al conectar al origen para '%s': %s\n", $dbName, $eConn->getMessage());
+            $failedCount++;
+            
+            $decision = [
+                'should_sync' => false,
+                'status' => 'failed',
+                'change_detected' => true,
+                'current_metadata' => [],
+                'previous_signature' => null,
+                'skip_reason' => 'Error de conexión origen'
+            ];
+            $jobId = SyncModel::createDatabaseSyncJobItem($runId, $dbName, $decision);
+            SyncModel::updateDatabaseSyncJobItem($jobId, 'failed', $eConn->getMessage());
+            continue;
+        }
+
+        // 3. Evaluar decisión de sincronización según firma metadata
+        try {
+            $decision = DatabaseMetadataService::evaluateSyncDecision($origenPdo, $destinoConnMain, $dbName);
+        } catch (Exception $eMeta) {
+            echo sprintf("  -> ERROR obteniendo metadatos de '%s': %s\n", $dbName, $eMeta->getMessage());
+            $failedCount++;
+            $jobId = SyncModel::createDatabaseSyncJobItem($runId, $dbName, [
+                'should_sync' => false,
+                'status' => 'failed',
+                'change_detected' => true,
+                'current_metadata' => [],
+                'previous_signature' => null,
+                'skip_reason' => 'Error en metadatos'
+            ]);
+            SyncModel::updateDatabaseSyncJobItem($jobId, 'failed', $eMeta->getMessage());
+            continue;
+        }
+
+        // CASO OMITIDO: Sin cambios en la firma metadata
+        if (!$decision['should_sync']) {
+            $skippedCount++;
+            echo sprintf("  -> RESULTADO: SKIPPED_UNCHANGED (Sin cambios desde la última versión sincronizada: %s)\n", substr($decision['previous_signature'] ?? '', 0, 12));
+            SyncModel::createDatabaseSyncJobItem($runId, $dbName, $decision);
+            continue;
+        }
+
+        // CASO SINCRONIZACIÓN REQUERIDA (SYNC REQUIRED)
+        echo sprintf("  -> RESULTADO: SYNC REQUIRED (Firma anterior: %s | Nueva firma: %s)\n",
+            substr($decision['previous_signature'] ?? 'NINGUNA', 0, 12),
+            substr($decision['current_metadata']['metadata_signature'], 0, 12)
+        );
+
+        $jobId = SyncModel::createDatabaseSyncJobItem($runId, $dbName, $decision);
+        $dbStartTime = microtime(true);
+
+        try {
+            // Asegurar que la base de datos de destino existe físicamente (mismo aprovisionamiento que en sincronización manual)
+            Database::ensureClientDatabaseExists($dbName, 'destino');
+            $destinoPdo = Database::getClienteConnection($dbName, 'destino');
+
+            // Desactivar temporalmente FK Checks y SQL estricto en Destino para igualar comportamiento manual
+            $destinoPdo->exec("SET FOREIGN_KEY_CHECKS = 0;");
+            $destinoPdo->exec("SET UNIQUE_CHECKS = 0;");
+            $destinoPdo->exec("SET SQL_MODE = '';");
+
+            // 4. Sincronizar todas las tablas excluyendo 'estadisticasUso'
+            $stmtTablas = $origenPdo->query("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'");
+            $tablas = [];
+            while ($row = $stmtTablas->fetch(PDO::FETCH_NUM)) {
+                $tName = $row[0];
+                if (!DatabaseMetadataService::isExcludedTable($tName)) {
+                    $tablas[] = $tName;
+                }
+            }
+
+            // A. Primero crear todas las estructuras de las tablas
+            foreach ($tablas as $tabla) {
+                try {
+                    $destinoPdo->query("SELECT 1 FROM `$tabla` LIMIT 1");
+                    $destinoPdo->exec("TRUNCATE TABLE `$tabla`;");
+                } catch (Exception $exPrep) {
+                    $stmtCreate = $origenPdo->query("SHOW CREATE TABLE `$tabla`");
+                    $createSql = $stmtCreate->fetch()['Create Table'];
+                    
+                    // Sanitizar colaciones incompatibles de MySQL 8.0 para MariaDB 10.x
+                    $createSql = preg_replace('/utf8mb4_0900_ai_ci/i', 'utf8mb4_unicode_ci', $createSql);
+                    $createSql = preg_replace('/utf8mb4_0900_bin/i', 'utf8mb4_bin', $createSql);
+                    $createSql = preg_replace('/utf8mb4_0[89]\d\d_[a-z0-9_]+/i', 'utf8mb4_unicode_ci', $createSql);
+
+                    $destinoPdo->exec($createSql);
+                }
+            }
+
+            // B. Copiar registros por bloques
+            foreach ($tablas as $tabla) {
+                $stmtCount = $origenPdo->query("SELECT COUNT(*) FROM `$tabla` ");
+                $totalReg = (int)$stmtCount->fetchColumn();
+
+                if ($totalReg > 0) {
+                    $limit = 1000;
+                    $offset = 0;
+                    while ($offset < $totalReg) {
+                        $stmtFetch = $origenPdo->query("SELECT * FROM `$tabla` LIMIT $limit OFFSET $offset");
+                        $rowsData = $stmtFetch->fetchAll(PDO::FETCH_ASSOC);
+
+                        if (!empty($rowsData)) {
+                            $destinoPdo->beginTransaction();
+                            $cols = array_map(fn($c) => "`$c`", array_keys($rowsData[0]));
+                            $sql = "INSERT INTO `$tabla` (" . implode(', ', $cols) . ") VALUES (" . implode(', ', array_fill(0, count($cols), '?')) . ")";
+                            $stmtIns = $destinoPdo->prepare($sql);
+                            foreach ($rowsData as $r) {
+                                $stmtIns->execute(array_values($r));
+                            }
+                            $destinoPdo->commit();
+                        }
+                        $offset += count($rowsData);
+                        if (count($rowsData) === 0) break;
+                    }
+                }
+            }
+
+            // Reactivar Foreign Key Checks
+            $destinoPdo->exec("SET FOREIGN_KEY_CHECKS = 1;");
+            $destinoPdo->exec("SET UNIQUE_CHECKS = 1;");
+
+            $dbDuration = (int)ceil(microtime(true) - $dbStartTime);
+
+            // Obtener tamaño destino aproximado
+            $destSizeBytes = $decision['current_metadata']['total_size_bytes'];
+
+            // 5. ¡ÉXITO! Actualizar estado del Job
+            SyncModel::updateDatabaseSyncJobItem($jobId, 'completed', null, $dbDuration, $destSizeBytes);
+
+            // CRÍTICO: Registrar la firma exitosa en database_sync_state
+            DatabaseMetadataService::recordSuccessfulSync(
+                $destinoConnMain,
+                $runId,
+                $dbName,
+                $decision['current_metadata']
+            );
+
+            $successfulCount++;
+            $syncDurations[] = $dbDuration;
+
+            echo sprintf("  -> Sincronización EXITOSA en %d segundos. (Tamaño: %s)\n", $dbDuration, BackupService::formatBytes($destSizeBytes));
+
+            // Métricas de mayor peso, más lento y más rápido
+            if ($destSizeBytes > $heaviestSynced['size']) {
+                $heaviestSynced = ['name' => $dbName, 'size' => $destSizeBytes];
+            }
+            if ($dbDuration > $slowestSynced['duration']) {
+                $slowestSynced = ['name' => $dbName, 'duration' => $dbDuration];
+            }
+            if ($dbDuration < $fastestSynced['duration']) {
+                $fastestSynced = ['name' => $dbName, 'duration' => $dbDuration];
+            }
+
+        } catch (Exception $eSync) {
+            if (isset($destinoPdo) && $destinoPdo->inTransaction()) {
+                try { $destinoPdo->rollBack(); } catch (Exception $exRb) {}
+            }
+            if (isset($destinoPdo)) {
+                try { $destinoPdo->exec("SET FOREIGN_KEY_CHECKS = 1;"); } catch (Exception $exFk) {}
+            }
+            $dbDuration = (int)ceil(microtime(true) - $dbStartTime);
+            $failedCount++;
+            echo sprintf("  -> ERROR durante sincronización de '%s': %s\n", $dbName, $eSync->getMessage());
+
+            // Marcar job como fallido (NO ACTUALIZAR database_sync_state)
+            SyncModel::updateDatabaseSyncJobItem($jobId, 'failed', $eSync->getMessage(), $dbDuration);
+        }
+    }
+
+    $totalDuration = (int)ceil(microtime(true) - $startTime);
+    $runStatus = ($failedCount === 0) ? 'completed' : ($successfulCount > 0 ? 'completed_with_errors' : 'failed');
+
+    // Finalizar registro global
+    SyncModel::finishDatabaseSyncRun(
+        $runId,
+        $runStatus,
+        $totalDatabases,
+        $processedCount,
+        $successfulCount,
+        $failedCount,
+        $skippedCount,
+        $totalDuration
+    );
+
+    // Calcular tiempo ahorrado estimado (Promedio de tiempo por base sincronizada * bases omitidas)
+    $avgDurationPerSync = !empty($syncDurations) ? array_sum($syncDurations) / count($syncDurations) : 0;
+    $estimatedSavedSeconds = (int)round($avgDurationPerSync * $skippedCount);
+
+    $savedHours = floor($estimatedSavedSeconds / 3600);
+    $savedMins = floor(($estimatedSavedSeconds % 3600) / 60);
+    $savedSecs = $estimatedSavedSeconds % 60;
+    $savedText = sprintf("%02dh %02dm %02ds", $savedHours, $savedMins, $savedSecs);
+
+    $totHours = floor($totalDuration / 3600);
+    $totMins = floor(($totalDuration % 3600) / 60);
+    $totSecs = $totalDuration % 60;
+    $totText = sprintf("%02dh %02dm %02ds", $totHours, $totMins, $totSecs);
+
+    echo "\n======================================================================\n";
+    echo "                     ESTADÍSTICAS FINALES DE EJECUCIÓN                 \n";
+    echo "======================================================================\n";
+    echo sprintf(" TOTAL BASES DETECTADAS        : %d\n", $totalDatabases);
+    echo sprintf(" TOTAL SIN CAMBIOS (SKIPPED)   : %d\n", $skippedCount);
+    echo sprintf(" TOTAL SINCRONIZADAS           : %d\n", $successfulCount);
+    echo sprintf(" TOTAL FALLIDAS                : %d\n", $failedCount);
+    echo sprintf(" TIEMPO TOTAL DE EJECUCIÓN     : %s (%d s)\n", $totText, $totalDuration);
+    echo sprintf(" TIEMPO AHORRADO ESTIMADO      : %s\n", $savedText);
+
+    if ($heaviestSynced['name']) {
+        echo sprintf(" BASE MÁS PESADA SINCRONIZADA   : %s (%s)\n", $heaviestSynced['name'], BackupService::formatBytes($heaviestSynced['size']));
+    }
+    if ($slowestSynced['name']) {
+        echo sprintf(" BASE MÁS LENTA                : %s (%d s)\n", $slowestSynced['name'], $slowestSynced['duration']);
+    }
+    if ($fastestSynced['name'] && $fastestSynced['duration'] !== PHP_INT_MAX) {
+        echo sprintf(" BASE MÁS RÁPIDA               : %s (%d s)\n", $fastestSynced['name'], $fastestSynced['duration']);
+    }
+    echo " TABLA EXCLUIDA                : estadisticasUso (Intacta en origen, omitida en firmas y sync)\n";
+    echo "======================================================================\n";
+
+    return [
+        'success' => true,
+        'run_id' => $runId,
+        'total' => $totalDatabases,
+        'skipped' => $skippedCount,
+        'successful' => $successfulCount,
+        'failed' => $failedCount,
+        'duration_seconds' => $totalDuration
+    ];
+}
+
+// Ejecución directa CLI
+if (php_sapi_name() === 'cli') {
+    runAutomaticSync('cron');
+}

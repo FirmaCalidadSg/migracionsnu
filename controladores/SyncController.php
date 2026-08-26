@@ -73,6 +73,11 @@ class SyncController {
             while ($row = $stmtTablas->fetch(PDO::FETCH_NUM)) {
                 $tablaNombre = $row[0];
                 
+                // Excluir tabla estadisticasUso del proceso de sincronización
+                if (DatabaseMetadataService::isExcludedTable($tablaNombre)) {
+                    continue;
+                }
+                
                 // Contar registros en origen para dimensionar la barra de progreso
                 $stmtCount = $dbOrigen->query("SELECT COUNT(*) FROM `$tablaNombre`");
                 $totalReg = (int)$stmtCount->fetchColumn();
@@ -141,6 +146,10 @@ class SyncController {
 
             if ($jobId <= 0 || empty($tabla)) {
                 throw new Exception("Parámetros de sincronización incompletos.");
+            }
+
+            if (DatabaseMetadataService::isExcludedTable($tabla)) {
+                throw new Exception("La tabla '$tabla' está excluida expresamente del proceso de sincronización.");
             }
 
             // 1. Obtener información del Job
@@ -340,6 +349,15 @@ class SyncController {
 
             SyncModel::updateSyncJobStatus($jobId, 'completado');
 
+            // Registrar la firma metadata exitosa en database_sync_state
+            try {
+                $dbOrigen = Database::getClienteConnection($job['schema_name'], 'origen');
+                $metadata = DatabaseMetadataService::getDatabaseMetadata($dbOrigen, $job['schema_name']);
+                DatabaseMetadataService::recordSuccessfulSync($dbDest, $jobId, $job['schema_name'], $metadata);
+            } catch (Exception $eMeta) {
+                SyncModel::log('advertencia', $job['cliente_nombre'], $job['schema_name'], "No se pudo actualizar estado metadata en database_sync_state: " . $eMeta->getMessage(), null, $jobId);
+            }
+
             SyncModel::log(
                 'info',
                 $job['cliente_nombre'],
@@ -428,6 +446,10 @@ class SyncController {
      * Valida y prepara la estructura de la tabla en destino (Fase 2).
      */
     private function prepararTablaDestino(PDO $dbOrigen, PDO $dbDestino, string $tabla): void {
+        if (DatabaseMetadataService::isExcludedTable($tabla)) {
+            return;
+        }
+
         // Verificar si la tabla existe en destino de forma ultra compatible
         try {
             $dbDestino->query("SELECT 1 FROM `$tabla` LIMIT 1");
@@ -442,6 +464,11 @@ class SyncController {
             $row = $stmtCreate->fetch();
             $createSql = $row['Create Table'];
             
+            // Sanitizar colaciones incompatibles con MariaDB (ej: MySQL 8.0 utf8mb4_0900_ai_ci)
+            $createSql = preg_replace('/utf8mb4_0900_ai_ci/i', 'utf8mb4_unicode_ci', $createSql);
+            $createSql = preg_replace('/utf8mb4_0900_bin/i', 'utf8mb4_bin', $createSql);
+            $createSql = preg_replace('/utf8mb4_0[89]\d\d_[a-z0-9_]+/i', 'utf8mb4_unicode_ci', $createSql);
+
             // Ejecutar creación en destino
             $dbDestino->exec($createSql);
         } else {
@@ -612,6 +639,32 @@ class SyncController {
                 'status' => DatabaseProvisioningService::STATE_ERROR,
                 'message' => $e->getMessage()
             ]);
+        }
+    }
+
+    /**
+     * Devuelve el resumen de las ejecuciones globales de sincronización nocturna en formato JSON.
+     */
+    public function getSyncRuns(): void {
+        header('Content-Type: application/json');
+        try {
+            $summary = SyncModel::getSyncRunsSummary();
+            echo json_encode(['success' => true, 'data' => $summary]);
+        } catch (Exception $e) {
+            echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+        }
+    }
+
+    /**
+     * Devuelve el contenido del archivo de log del cronjob en formato JSON.
+     */
+    public function getCronLog(): void {
+        header('Content-Type: application/json');
+        try {
+            $content = SyncModel::getCronLogContent();
+            echo json_encode(['success' => true, 'log' => $content]);
+        } catch (Exception $e) {
+            echo json_encode(['success' => false, 'error' => $e->getMessage()]);
         }
     }
 

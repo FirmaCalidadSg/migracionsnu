@@ -39,7 +39,18 @@ class Database {
         }
 
         $dbConfig = $config[$key];
-        $dbName = $dbConfig['prefix'] . ($schema ?? $dbConfig['name']);
+        $prefix = $dbConfig['prefix'] ?? '';
+
+        if ($schema !== null) {
+            if (!empty($prefix) && str_starts_with(strtolower($schema), strtolower($prefix))) {
+                $dbName = $schema;
+            } else {
+                $dbName = $prefix . $schema;
+            }
+        } else {
+            $dbName = $prefix . $dbConfig['name'];
+        }
+
         $isDev = $config['is_dev'] ?? false;
 
         if ($isDev && $schema !== null) {
@@ -54,10 +65,32 @@ class Database {
     }
 
     /**
-     * Obtiene la conexión PDO al esquema (base de datos) de un cliente específico
+     * Obtiene la conexión PDO al esquema (base de datos) de un cliente específico.
+     * Si la conexión al origen falla con el nombre original, reintenta con minúsculas o mayúsculas.
      */
     public static function getClienteConnection(string $schema, string $conexionKey): PDO {
-        return self::connect($conexionKey, $schema);
+        try {
+            return self::connect($conexionKey, $schema);
+        } catch (Exception $e) {
+            if ($conexionKey === 'origen') {
+                // 1. Reintentar en minúsculas si el original tenía mayúsculas
+                $schemaLower = strtolower($schema);
+                if ($schemaLower !== $schema) {
+                    try {
+                        return self::connect($conexionKey, $schemaLower);
+                    } catch (Exception $eLower) {}
+                }
+
+                // 2. Reintentar en mayúsculas
+                $schemaUpper = strtoupper($schema);
+                if ($schemaUpper !== $schema) {
+                    try {
+                        return self::connect($conexionKey, $schemaUpper);
+                    } catch (Exception $eUpper) {}
+                }
+            }
+            throw $e;
+        }
     }
 
     /**

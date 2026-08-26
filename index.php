@@ -74,6 +74,13 @@ try {
             $controller->asociarVirtualmin();
             break;
 
+        case 'get_sync_runs':
+            $controller->getSyncRuns();
+            break;
+        case 'get_cron_log':
+            $controller->getCronLog();
+            break;
+
         // MÓDULO INDEPENDIENTE DE BACKUPS DE BASES DE DATOS
         case 'backup_index':
             $backupController->index();

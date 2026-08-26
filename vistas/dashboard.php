@@ -403,8 +403,30 @@
     <!-- Contenido Principal -->
     <div class="container my-5">
         
-        <!-- Tarjetas de Métricas / KPIs -->
-        <div class="row g-4 mb-5">
+        <!-- Selector de Modo de Vista -->
+        <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-3">
+            <div class="d-flex gap-2">
+                <button class="nav-link-custom active" id="tab-btn-clients" onclick="switchViewTab('clients')">
+                    <i class="bi bi-people-fill"></i> Clientes y Mapeo Manual
+                </button>
+                <button class="nav-link-custom" id="tab-btn-cron" onclick="switchViewTab('cron')">
+                    <i class="bi bi-clock-history"></i> Sincronizaciones Nocturnas (Cron Job)
+                </button>
+            </div>
+            <div class="d-flex align-items-center gap-2">
+                <span class="badge-custom badge-ok">
+                    <i class="bi bi-shield-check"></i> Origen: 100% Read-Only
+                </span>
+                <span class="badge-custom badge-warning-custom" title="Tabla estadisticasUso excluida de firmas y transferencias">
+                    <i class="bi bi-eye-slash"></i> estadisticasUso Excluida
+                </span>
+            </div>
+        </div>
+
+        <!-- SECCIÓN 1: VISTA DE CLIENTES Y MAPEO MANUAL -->
+        <div id="clients-view-container">
+            <!-- Tarjetas de Métricas / KPIs -->
+            <div class="row g-4 mb-5">
             <div class="col-md-3">
                 <div class="glass-card kpi-card kpi-info">
                     <div class="text-muted text-uppercase fw-semibold" style="font-size: 0.75rem;">Total Clientes</div>
@@ -534,6 +556,134 @@
                         </tr>
                     </tbody>
                 </table>
+            </div>
+        </div>
+        </div> <!-- Cierre de #clients-view-container -->
+
+        <!-- SECCIÓN 2: VISTA DE SINCRONIZACIONES NOCTURNAS (CRON JOB & DETECCIÓN DE CAMBIOS) -->
+        <div id="cron-view-container" class="d-none">
+            <!-- KPIs de Sincronización Nocturna -->
+            <div class="row g-4 mb-4">
+                <div class="col-md-3">
+                    <div class="glass-card kpi-card kpi-info">
+                        <div class="text-muted text-uppercase fw-semibold" style="font-size: 0.75rem;">Total Bases Detectadas</div>
+                        <div class="kpi-val" id="cron-kpi-total">0</div>
+                        <i class="bi bi-database position-absolute text-muted opacity-25" style="font-size: 3rem; right: 20px; bottom: 10px;"></i>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="glass-card kpi-card kpi-success">
+                        <div class="text-muted text-uppercase fw-semibold" style="font-size: 0.75rem;">Sin Cambios (Omitidas)</div>
+                        <div class="kpi-val text-success" id="cron-kpi-skipped">0</div>
+                        <i class="bi bi-shield-check position-absolute text-success opacity-25" style="font-size: 3rem; right: 20px; bottom: 10px;"></i>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="glass-card kpi-card">
+                        <div class="text-muted text-uppercase fw-semibold" style="font-size: 0.75rem;">Sincronizadas</div>
+                        <div class="kpi-val text-primary" id="cron-kpi-synced">0</div>
+                        <i class="bi bi-arrow-repeat position-absolute text-primary opacity-25" style="font-size: 3rem; right: 20px; bottom: 10px;"></i>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="glass-card kpi-card kpi-info">
+                        <div class="text-muted text-uppercase fw-semibold" style="font-size: 0.75rem;">Tiempo Ahorrado Estimado</div>
+                        <div class="kpi-val text-cyan" id="cron-kpi-saved" style="font-size: 1.5rem; margin-top: 15px;">00h 00m</div>
+                        <i class="bi bi-lightning-charge position-absolute text-info opacity-25" style="font-size: 3rem; right: 20px; bottom: 10px;"></i>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tabla de Historial de Ejecuciones Globales -->
+            <div class="glass-card p-4 mb-4">
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h6 class="mb-0 fw-semibold d-flex align-items-center gap-2">
+                        <i class="bi bi-clock-history text-info"></i>
+                        <span>Historial de Ejecuciones Nocturnas (database_sync_runs)</span>
+                    </h6>
+                    <button class="btn btn-secondary-custom btn-sm" onclick="loadCronData()">
+                        <i class="bi bi-arrow-clockwise me-1"></i> Actualizar Feedback
+                    </button>
+                </div>
+                <div class="table-responsive">
+                    <table class="table-premium">
+                        <thead>
+                            <tr>
+                                <th># Run ID</th>
+                                <th>Fecha Inicio</th>
+                                <th>Fecha Fin</th>
+                                <th>Estado</th>
+                                <th>Bases Total</th>
+                                <th>Sin Cambios (Omitidas)</th>
+                                <th>Sincronizadas</th>
+                                <th>Fallidas</th>
+                                <th>Duración Total</th>
+                            </tr>
+                        </thead>
+                        <tbody id="cron-runs-table-body">
+                            <tr>
+                                <td colspan="9" class="text-center py-4 text-muted">
+                                    <div class="spinner-border spinner-border-sm me-2"></div> Cargando historial de ejecuciones nocturnas...
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Detalle de Firma de Metadatos y Estado por Base de Datos -->
+            <div class="glass-card p-4 mb-4">
+                <h6 class="mb-3 fw-semibold d-flex align-items-center gap-2">
+                    <i class="bi bi-fingerprint text-primary"></i>
+                    <span>Detalle por Base de Datos & Firmas Metadata (database_sync_jobs)</span>
+                </h6>
+                <div class="table-responsive">
+                    <table class="table-premium">
+                        <thead>
+                            <tr>
+                                <th>Base de Datos</th>
+                                <th>Estado</th>
+                                <th>Firma Metadata Previa</th>
+                                <th>Firma Metadata Actual</th>
+                                <th>Tamaño Origen</th>
+                                <th>Detalle / Razón</th>
+                            </tr>
+                        </thead>
+                        <tbody id="cron-jobs-table-body">
+                            <tr>
+                                <td colspan="6" class="text-center py-4 text-muted">
+                                    No hay ejecuciones registradas aún.
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Visor de Logs del Cronjob -->
+            <div class="glass-card p-4">
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h6 class="mb-0 fw-semibold d-flex align-items-center gap-2">
+                        <i class="bi bi-terminal-fill text-warning"></i>
+                        <span>Bitácora Directa del Cron Job (/var/log/sync_worker.log)</span>
+                    </h6>
+                    <button class="btn btn-action btn-sm" onclick="loadCronLog()">
+                        <i class="bi bi-arrow-clockwise me-1"></i> Leer Log Actual
+                    </button>
+                </div>
+                <div class="terminal-container">
+                    <div class="terminal-header">
+                        <div class="terminal-dots">
+                            <div class="terminal-dot dot-red"></div>
+                            <div class="terminal-dot dot-yellow"></div>
+                            <div class="terminal-dot dot-green"></div>
+                        </div>
+                        <span class="text-muted" style="font-size: 0.75rem;">Log de Servidor: /var/log/sync_worker.log</span>
+                    </div>
+                    <div class="terminal-body" id="cron-log-terminal" style="height: 350px; color: #e5e7eb; font-size: 0.85rem;">
+                        <div class="text-muted">Haz clic en "Leer Log Actual" para visualizar la salida del Cron.</div>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
@@ -1151,6 +1301,152 @@
 
                 container.appendChild(row);
             });
+        }
+
+        // ==========================================
+        // GESTIÓN DE VISTAS Y CRON JOB FEEDBACK
+        // ==========================================
+        function switchViewTab(tab) {
+            const btnClients = document.getElementById('tab-btn-clients');
+            const btnCron = document.getElementById('tab-btn-cron');
+            const clientsContainer = document.getElementById('clients-view-container');
+            const cronContainer = document.getElementById('cron-view-container');
+
+            if (tab === 'clients') {
+                btnClients.classList.add('active');
+                btnCron.classList.remove('active');
+                clientsContainer.classList.remove('d-none');
+                cronContainer.classList.add('d-none');
+            } else {
+                btnCron.classList.add('active');
+                btnClients.classList.remove('active');
+                cronContainer.classList.remove('d-none');
+                clientsContainer.classList.add('d-none');
+                loadCronData();
+                loadCronLog();
+            }
+        }
+
+        function loadCronData() {
+            fetch('index.php?action=get_sync_runs')
+                .then(r => r.json())
+                .then(res => {
+                    if (!res.success) return;
+                    renderCronRuns(res.data);
+                })
+                .catch(e => console.error('Error al cargar cron runs:', e));
+        }
+
+        function renderCronRuns(data) {
+            const latestRun = data.latest_run;
+            if (latestRun) {
+                document.getElementById('cron-kpi-total').innerText = latestRun.total_databases || 0;
+                document.getElementById('cron-kpi-skipped').innerText = latestRun.skipped_databases || 0;
+                document.getElementById('cron-kpi-synced').innerText = latestRun.successful_databases || 0;
+                
+                // Calcular ahorro estimado
+                const skipped = parseInt(latestRun.skipped_databases || 0);
+                const duration = parseInt(latestRun.total_duration_seconds || 0);
+                const total = parseInt(latestRun.total_databases || 1);
+                const avgSyncTime = total > 0 ? (duration / Math.max(1, total - skipped)) : 0;
+                const savedSeconds = Math.round(avgSyncTime * skipped);
+                
+                const hrs = Math.floor(savedSeconds / 3600);
+                const mins = Math.floor((savedSeconds % 3600) / 60);
+                document.getElementById('cron-kpi-saved').innerText = `${String(hrs).padStart(2, '0')}h ${String(mins).padStart(2, '0')}m`;
+            }
+
+            // Renderizar Runs
+            const runsTbody = document.getElementById('cron-runs-table-body');
+            runsTbody.innerHTML = '';
+
+            if (!data.runs || data.runs.length === 0) {
+                runsTbody.innerHTML = '<tr><td colspan="9" class="text-center py-4 text-muted">Aún no hay ejecuciones registradas.</td></tr>';
+            } else {
+                data.runs.forEach(r => {
+                    const tr = document.createElement('tr');
+                    const badgeClass = r.status === 'completed' ? 'badge-ok' : (r.status === 'running' ? 'badge-active' : 'badge-err');
+                    tr.innerHTML = `
+                        <td><strong>#${r.id}</strong></td>
+                        <td>${r.started_at || '—'}</td>
+                        <td>${r.finished_at || '—'}</td>
+                        <td><span class="badge-custom ${badgeClass}">${(r.status || '').toUpperCase()}</span></td>
+                        <td class="fw-bold">${r.total_databases}</td>
+                        <td class="text-success fw-bold">${r.skipped_databases}</td>
+                        <td class="text-primary fw-bold">${r.successful_databases}</td>
+                        <td class="text-danger fw-bold">${r.failed_databases}</td>
+                        <td>${r.total_duration_seconds} seg</td>
+                    `;
+                    runsTbody.appendChild(tr);
+                });
+            }
+
+            // Renderizar Jobs de la última ejecución
+            const jobsTbody = document.getElementById('cron-jobs-table-body');
+            jobsTbody.innerHTML = '';
+
+            if (!data.jobs || data.jobs.length === 0) {
+                jobsTbody.innerHTML = '<tr><td colspan="6" class="text-center py-4 text-muted">No hay ejecuciones de jobs individuales aún.</td></tr>';
+            } else {
+                data.jobs.forEach(j => {
+                    const tr = document.createElement('tr');
+                    let statusBadge = '';
+                    if (j.status === 'skipped_unchanged') {
+                        statusBadge = '<span class="badge-custom badge-warning-custom"><i class="bi bi-shield-check me-1"></i> SKIPPED_UNCHANGED</span>';
+                    } else if (j.status === 'completed') {
+                        statusBadge = '<span class="badge-custom badge-ok"><i class="bi bi-check-circle me-1"></i> COMPLETED</span>';
+                    } else if (j.status === 'failed') {
+                        statusBadge = '<span class="badge-custom badge-err"><i class="bi bi-x-circle me-1"></i> FAILED</span>';
+                    } else {
+                        statusBadge = `<span class="badge-custom badge-active">${(j.status || '').toUpperCase()}</span>`;
+                    }
+
+                    const prevSig = j.previous_metadata_signature ? j.previous_metadata_signature.substring(0, 14) + '...' : '—';
+                    const currSig = j.metadata_signature ? j.metadata_signature.substring(0, 14) + '...' : '—';
+                    const sizeStr = formatBytesJS(parseInt(j.source_size_bytes || 0));
+
+                    tr.innerHTML = `
+                        <td><strong class="text-white">${j.database_name}</strong></td>
+                        <td>${statusBadge}</td>
+                        <td><code>${prevSig}</code></td>
+                        <td><code class="text-cyan">${currSig}</code></td>
+                        <td>${sizeStr}</td>
+                        <td class="text-muted" style="font-size: 0.85rem;">${j.skip_reason || j.error_message || '—'}</td>
+                    `;
+                    jobsTbody.appendChild(tr);
+                });
+            }
+        }
+
+        function loadCronLog() {
+            const terminal = document.getElementById('cron-log-terminal');
+            terminal.innerHTML = '<div class="text-muted p-3"><div class="spinner-border spinner-border-sm me-2"></div> Cargando log del cron...</div>';
+            
+            fetch('index.php?action=get_cron_log')
+                .then(r => r.json())
+                .then(res => {
+                    if (!res.success) {
+                        terminal.innerHTML = `<div class="text-danger p-3">${res.error}</div>`;
+                        return;
+                    }
+                    terminal.innerHTML = `<pre style="color: #e5e7eb; font-family: monospace; white-space: pre-wrap; margin: 0;">${escapeHtml(res.log)}</pre>`;
+                    terminal.scrollTop = terminal.scrollHeight;
+                })
+                .catch(e => {
+                    terminal.innerHTML = `<div class="text-danger p-3">Error de comunicación: ${e}</div>`;
+                });
+        }
+
+        function formatBytesJS(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        function escapeHtml(text) {
+            return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
         }
     </script>
 </body>

@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/Database.php';
+require_once __DIR__ . '/DatabaseMetadataService.php';
 
 class SyncModel {
     
@@ -216,5 +217,271 @@ class SyncModel {
         
         $stmt->execute();
         return $stmt->fetchAll();
+    }
+
+    /**
+     * Asegura la existencia idempotente de las tablas de control en el servidor de destino.
+     */
+    public static function ensureControlTablesExist(): void {
+        try {
+            $destino = Database::getDestinoConnection();
+            $destino->exec("
+                CREATE TABLE IF NOT EXISTS `database_sync_runs` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `started_at` DATETIME NOT NULL,
+                    `finished_at` DATETIME NULL,
+                    `status` ENUM('pending', 'running', 'completed', 'completed_with_errors', 'failed') DEFAULT 'pending',
+                    `total_databases` INT DEFAULT 0,
+                    `processed_databases` INT DEFAULT 0,
+                    `successful_databases` INT DEFAULT 0,
+                    `failed_databases` INT DEFAULT 0,
+                    `skipped_databases` INT DEFAULT 0,
+                    `total_duration_seconds` INT DEFAULT 0,
+                    `trigger_type` VARCHAR(50) DEFAULT 'scheduled',
+                    `pid` INT NULL,
+                    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC;
+
+                CREATE TABLE IF NOT EXISTS `database_sync_jobs` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `run_id` INT NOT NULL,
+                    `database_name` VARCHAR(100) NOT NULL,
+                    `status` ENUM('pending', 'checking', 'syncing', 'completed', 'failed', 'skipped_unchanged', 'skipped_excluded') DEFAULT 'pending',
+                    `started_at` DATETIME NULL,
+                    `finished_at` DATETIME NULL,
+                    `duration_seconds` INT DEFAULT 0,
+                    `source_size_bytes` BIGINT DEFAULT 0,
+                    `destination_size_bytes` BIGINT DEFAULT 0,
+                    `table_count` INT DEFAULT 0,
+                    `estimated_rows` BIGINT DEFAULT 0,
+                    `metadata_signature` VARCHAR(64) NULL,
+                    `previous_metadata_signature` VARCHAR(64) NULL,
+                    `change_detected` TINYINT(1) DEFAULT 1,
+                    `skip_reason` VARCHAR(255) NULL,
+                    `error_message` TEXT NULL,
+                    `attempts` INT DEFAULT 0,
+                    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    INDEX (`run_id`),
+                    INDEX (`database_name`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC;
+
+                CREATE TABLE IF NOT EXISTS `database_sync_state` (
+                    `database_name` VARCHAR(100) PRIMARY KEY,
+                    `last_successful_run_id` INT NULL,
+                    `last_successful_at` DATETIME NULL,
+                    `last_source_size_bytes` BIGINT DEFAULT 0,
+                    `last_table_count` INT DEFAULT 0,
+                    `last_estimated_rows` BIGINT DEFAULT 0,
+                    `last_metadata_signature` VARCHAR(64) NULL,
+                    `last_status` VARCHAR(50) DEFAULT 'completed',
+                    `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC;
+            ");
+        } catch (Exception $e) {}
+    }
+
+    /**
+     * Crea un registro de ejecución global en `database_sync_runs`.
+     */
+    public static function createDatabaseSyncRun(string $triggerType = 'scheduled', int $totalDatabases = 0): int {
+        self::ensureControlTablesExist();
+        $destino = Database::getDestinoConnection();
+        $stmt = $destino->prepare("
+            INSERT INTO database_sync_runs (started_at, status, total_databases, trigger_type, pid)
+            VALUES (NOW(), 'running', :total, :trigger_type, :pid)
+        ");
+        $stmt->execute([
+            'total' => $totalDatabases,
+            'trigger_type' => $triggerType,
+            'pid' => getmypid()
+        ]);
+        return (int)$destino->lastInsertId();
+    }
+
+    /**
+     * Finaliza un registro de ejecución global en `database_sync_runs`.
+     */
+    public static function finishDatabaseSyncRun(
+        int $runId,
+        string $status,
+        int $total,
+        int $processed,
+        int $successful,
+        int $failed,
+        int $skipped,
+        int $durationSeconds
+    ): void {
+        $destino = Database::getDestinoConnection();
+        $stmt = $destino->prepare("
+            UPDATE database_sync_runs 
+            SET finished_at = NOW(),
+                status = :status,
+                total_databases = :total,
+                processed_databases = :processed,
+                successful_databases = :successful,
+                failed_databases = :failed,
+                skipped_databases = :skipped,
+                total_duration_seconds = :duration
+            WHERE id = :id
+        ");
+        $stmt->execute([
+            'status' => $status,
+            'total' => $total,
+            'processed' => $processed,
+            'successful' => $successful,
+            'failed' => $failed,
+            'skipped' => $skipped,
+            'duration' => $durationSeconds,
+            'id' => $runId
+        ]);
+    }
+
+    /**
+     * Registra un job individual por base de datos en `database_sync_jobs`.
+     */
+    public static function createDatabaseSyncJobItem(int $runId, string $databaseName, array $decisionData): int {
+        $databaseName = strtolower(trim($databaseName));
+        $destino = Database::getDestinoConnection();
+        $meta = $decisionData['current_metadata'] ?? [];
+
+        $isSyncing = ($decisionData['status'] === 'syncing');
+
+        $stmt = $destino->prepare("
+            INSERT INTO database_sync_jobs (
+                run_id, database_name, status, started_at, finished_at,
+                source_size_bytes, table_count, estimated_rows,
+                metadata_signature, previous_metadata_signature,
+                change_detected, skip_reason
+            ) VALUES (
+                :run_id, :database_name, :status, :started_at, :finished_at,
+                :source_size, :table_count, :estimated_rows,
+                :metadata_signature, :previous_signature,
+                :change_detected, :skip_reason
+            )
+        ");
+
+        $stmt->execute([
+            'run_id' => $runId,
+            'database_name' => $databaseName,
+            'status' => $decisionData['status'],
+            'started_at' => $isSyncing ? date('Y-m-d H:i:s') : null,
+            'finished_at' => !$isSyncing ? date('Y-m-d H:i:s') : null,
+            'source_size' => $meta['total_size_bytes'] ?? 0,
+            'table_count' => $meta['table_count'] ?? 0,
+            'estimated_rows' => $meta['total_rows_estimated'] ?? 0,
+            'metadata_signature' => $meta['metadata_signature'] ?? null,
+            'previous_signature' => $decisionData['previous_signature'] ?? null,
+            'change_detected' => $decisionData['change_detected'] ? 1 : 0,
+            'skip_reason' => $decisionData['skip_reason'] ?? null
+        ]);
+
+        return (int)$destino->lastInsertId();
+    }
+
+    /**
+     * Actualiza el resultado final de un job individual en `database_sync_jobs`.
+     */
+    public static function updateDatabaseSyncJobItem(
+        int $jobId,
+        string $status,
+        ?string $errorMessage = null,
+        ?int $durationSeconds = null,
+        ?int $destSizeBytes = null
+    ): void {
+        $destino = Database::getDestinoConnection();
+        $stmt = $destino->prepare("
+            UPDATE database_sync_jobs
+            SET status = :status,
+                finished_at = NOW(),
+                duration_seconds = :duration,
+                destination_size_bytes = :dest_size,
+                error_message = :error_message
+            WHERE id = :id
+        ");
+        $stmt->execute([
+            'status' => $status,
+            'duration' => $durationSeconds ?? 0,
+            'dest_size' => $destSizeBytes ?? 0,
+            'error_message' => $errorMessage,
+            'id' => $jobId
+        ]);
+    }
+
+    /**
+     * Obtiene el listado de ejecuciones de sincronización globales y el detalle de la última ejecución.
+     */
+    public static function getSyncRunsSummary(int $limit = 20): array {
+        self::ensureControlTablesExist();
+        $destino = Database::getDestinoConnection();
+
+        // 1. Obtener lista de corridas globales
+        $stmtRuns = $destino->prepare("
+            SELECT id, started_at, finished_at, status, total_databases,
+                   processed_databases, successful_databases, failed_databases,
+                   skipped_databases, total_duration_seconds, trigger_type, pid, created_at
+            FROM database_sync_runs
+            ORDER BY id DESC
+            LIMIT :limit
+        ");
+        $stmtRuns->bindValue(':limit', $limit, PDO::PARAM_INT);
+        $stmtRuns->execute();
+        $runs = $stmtRuns->fetchAll(PDO::FETCH_ASSOC);
+
+        // 2. Obtener estado actual por cada base de datos registrada
+        $stmtState = $destino->query("
+            SELECT database_name, last_successful_run_id, last_successful_at,
+                   last_source_size_bytes, last_table_count, last_estimated_rows,
+                   last_metadata_signature, last_status, updated_at
+            FROM database_sync_state
+            ORDER BY database_name ASC
+        ");
+        $states = $stmtState->fetchAll(PDO::FETCH_ASSOC);
+
+        // 3. Obtener detalle de jobs de la última corrida si existe
+        $latestRunId = !empty($runs) ? (int)$runs[0]['id'] : null;
+        $jobs = [];
+        if ($latestRunId !== null) {
+            $stmtJobs = $destino->prepare("
+                SELECT id, run_id, database_name, status, started_at, finished_at,
+                       duration_seconds, source_size_bytes, destination_size_bytes,
+                       table_count, estimated_rows, metadata_signature,
+                       previous_metadata_signature, change_detected, skip_reason, error_message
+                FROM database_sync_jobs
+                WHERE run_id = :run_id
+                ORDER BY id ASC
+            ");
+            $stmtJobs->execute(['run_id' => $latestRunId]);
+            $jobs = $stmtJobs->fetchAll(PDO::FETCH_ASSOC);
+        }
+
+        return [
+            'runs' => $runs,
+            'latest_run' => !empty($runs) ? $runs[0] : null,
+            'jobs' => $jobs,
+            'states' => $states
+        ];
+    }
+
+    /**
+     * Lee las últimas líneas del archivo de log del cron job (/var/log/sync_worker.log).
+     */
+    public static function getCronLogContent(int $maxLines = 200): string {
+        $logPath = '/var/log/sync_worker.log';
+        if (!file_exists($logPath)) {
+            $logPath = dirname(__DIR__) . '/storage/logs/sync_worker.log';
+        }
+        if (!file_exists($logPath)) {
+            return "No se ha encontrado el archivo de log en $logPath.";
+        }
+
+        $lines = @file($logPath);
+        if (!$lines) {
+            return "El archivo de log está vacío o no se puede leer.";
+        }
+
+        $slice = array_slice($lines, -$maxLines);
+        return implode('', $slice);
     }
 }
