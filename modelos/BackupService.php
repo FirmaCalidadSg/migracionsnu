@@ -154,7 +154,7 @@ class BackupService {
         $databases = [];
         try {
             $stmt = $pdo->prepare("
-                SELECT LOWER(SCHEMA_NAME) AS db_name 
+                SELECT SCHEMA_NAME AS db_name 
                 FROM INFORMATION_SCHEMA.SCHEMATA 
                 WHERE LOWER(SCHEMA_NAME) LIKE :prefix
                 ORDER BY SCHEMA_NAME ASC
@@ -165,8 +165,8 @@ class BackupService {
             $systemDbs = ['information_schema', 'mysql', 'performance_schema', 'sys', 'snuquality', 'snuqualityapp', 'snuqualityapp_wordpress'];
 
             foreach ($rows as $row) {
-                $db = strtolower(trim($row));
-                if (!in_array($db, $systemDbs, true) && preg_match('/^fugzcdpo_[a-zA-Z0-9_]+$/', $db)) {
+                $db = trim($row);
+                if (!in_array(strtolower($db), $systemDbs, true) && preg_match('/^fugzcdpo_[a-zA-Z0-9_]+$/i', $db)) {
                     $databases[] = $db;
                 }
             }

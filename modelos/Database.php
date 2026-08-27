@@ -57,7 +57,7 @@ class Database {
             $dbName .= '_' . $key;
         }
 
-        if ($key === 'destino' && $schema !== null) {
+        if ($key === 'destino') {
             $dbName = strtolower($dbName);
         }
 
@@ -118,6 +118,23 @@ class Database {
     }
 
     /**
+     * Comprueba si una excepción se debe a pérdida de conexión o límite de tamaño de paquete.
+     */
+    public static function isServerGoneException(Throwable $e): bool {
+        $msg = strtolower($e->getMessage());
+        $code = (int)$e->getCode();
+        return (
+            str_contains($msg, 'server has gone away') ||
+            str_contains($msg, 'communication link failure') ||
+            str_contains($msg, 'lost connection') ||
+            str_contains($msg, 'packet bigger than') ||
+            $code === 2006 ||
+            $code === 2013 ||
+            $code === 1153
+        );
+    }
+
+    /**
      * Crea una conexión PDO basada en la clave de configuración y opcionalmente un esquema de cliente
      */
     private static function connect(string $key, ?string $schema = null): PDO {
@@ -147,7 +164,17 @@ class Database {
         ];
 
         try {
-            return new PDO($dsn, $user, $pass, $options);
+            $pdo = new PDO($dsn, $user, $pass, $options);
+            
+            // Ampliar max_allowed_packet y timeouts en la sesión para evitar MySQL server has gone away (2006/1153)
+            try {
+                $pdo->exec("SET SESSION max_allowed_packet = 1073741824;");
+                $pdo->exec("SET SESSION net_read_timeout = 3600;");
+                $pdo->exec("SET SESSION net_write_timeout = 3600;");
+                $pdo->exec("SET SESSION wait_timeout = 28800;");
+            } catch (Exception $exOpt) {}
+
+            return $pdo;
         } catch (PDOException $e) {
             $errorCode = (int)($e->errorInfo[1] ?? $e->getCode());
             $isUnknownOrAccess = ($errorCode === 1049 || $errorCode === 1044);
@@ -155,7 +182,12 @@ class Database {
             if ($isUnknownOrAccess && $key === 'destino' && $schema !== null) {
                 try {
                     self::ensureClientDatabaseExists($schema, 'destino');
-                    return new PDO($dsn, $user, $pass, $options);
+                    $pdo = new PDO($dsn, $user, $pass, $options);
+                    try {
+                        $pdo->exec("SET SESSION max_allowed_packet = 1073741824;");
+                        $pdo->exec("SET SESSION net_read_timeout = 3600;");
+                    } catch (Exception $exOpt) {}
+                    return $pdo;
                 } catch (Exception $ex) {
                     throw new Exception("Error al conectar a la base de datos '$key' ($dbName@$host): " . $ex->getMessage(), (int)$e->getCode());
                 }

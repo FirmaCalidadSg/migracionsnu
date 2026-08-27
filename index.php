@@ -77,6 +77,9 @@ try {
         case 'get_sync_runs':
             $controller->getSyncRuns();
             break;
+        case 'revalidar_job_metadata':
+            $controller->revalidarJobMetadata();
+            break;
         case 'get_cron_log':
             $controller->getCronLog();
             break;

@@ -358,13 +358,20 @@
             --bs-text-opacity: 1;
             color: rgb(241 241 241 / 75%) !important;
         }
+        .col-reason {
+            max-width: 300px;
+            white-space: normal !important;
+            word-break: break-word;
+            font-size: 0.8rem;
+            line-height: 1.3;
+        }
     </style>
 </head>
 <body>
 
     <!-- Navegación Premium -->
     <nav class="navbar navbar-premium sticky-top">
-        <div class="container">
+        <div class="container-fluid px-4 px-xl-5">
             <div class="d-flex align-items-center gap-4">
                 <a class="navbar-brand navbar-brand-premium" href="index.php?action=index">
                     <i class="bi bi-arrow-repeat rotate-icon" style="font-size: 1.7rem;"></i>
@@ -401,7 +408,7 @@
     </nav>
 
     <!-- Contenido Principal -->
-    <div class="container my-5">
+    <div class="container-fluid px-4 px-xl-5 my-4">
         
         <!-- Selector de Modo de Vista -->
         <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-3">
@@ -629,20 +636,45 @@
                         </tbody>
                     </table>
                 </div>
+
+                <!-- Controles de Paginación a 5 Filas para Runs -->
+                <div class="d-flex flex-wrap justify-content-between align-items-center mt-3 pt-3 border-top border-secondary border-opacity-25" id="cron-runs-pagination-container">
+                    <div class="text-muted" style="font-size: 0.85rem;" id="cron-runs-pagination-info">
+                        Mostrando 0 de 0 ejecuciones nocturnas
+                    </div>
+                    <nav aria-label="Navegación de ejecuciones">
+                        <ul class="pagination pagination-sm mb-0" id="cron-runs-pagination-list">
+                            <!-- Botones dinámicos de paginación para runs -->
+                        </ul>
+                    </nav>
+                </div>
             </div>
 
             <!-- Detalle de Firma de Metadatos y Estado por Base de Datos -->
             <div class="glass-card p-4 mb-4">
-                <h6 class="mb-3 fw-semibold d-flex align-items-center gap-2">
-                    <i class="bi bi-fingerprint text-primary"></i>
-                    <span>Detalle por Base de Datos & Firmas Metadata (database_sync_jobs)</span>
-                </h6>
+                <div class="d-flex flex-wrap justify-content-between align-items-center mb-3 gap-2">
+                    <h6 class="mb-0 fw-semibold d-flex align-items-center gap-2">
+                        <i class="bi bi-fingerprint text-primary"></i>
+                        <span>Detalle por Base de Datos & Firmas Metadata (database_sync_jobs)</span>
+                    </h6>
+                    <div class="d-flex align-items-center gap-2">
+                        <label for="filter-job-status" class="text-muted mb-0" style="font-size: 0.85rem;"><i class="bi bi-funnel me-1"></i> Filtrar por estado:</label>
+                        <select id="filter-job-status" class="form-select form-select-sm" style="width: 210px; background: rgba(0,0,0,0.4); color: #e5e7eb; border: 1px solid var(--border-glass);" onchange="onJobsFilterChange(this.value)">
+                            <option value="all">Todos los estados</option>
+                            <option value="failed">❌ Solo FAILED (Fallidas)</option>
+                            <option value="completed">✓ Solo COMPLETED (Completadas)</option>
+                            <option value="skipped_unchanged">🛡 Solo SKIPPED (Omitidas)</option>
+                        </select>
+                    </div>
+                </div>
+
                 <div class="table-responsive">
                     <table class="table-premium">
                         <thead>
                             <tr>
                                 <th>Base de Datos</th>
                                 <th>Estado</th>
+                                <th>Última Sync Manual</th>
                                 <th>Firma Metadata Previa</th>
                                 <th>Firma Metadata Actual</th>
                                 <th>Tamaño Origen</th>
@@ -651,12 +683,24 @@
                         </thead>
                         <tbody id="cron-jobs-table-body">
                             <tr>
-                                <td colspan="6" class="text-center py-4 text-muted">
+                                <td colspan="7" class="text-center py-4 text-muted">
                                     No hay ejecuciones registradas aún.
                                 </td>
                             </tr>
                         </tbody>
                     </table>
+                </div>
+
+                <!-- Controles de Paginación a 5 Filas -->
+                <div class="d-flex flex-wrap justify-content-between align-items-center mt-3 pt-3 border-top border-secondary border-opacity-25" id="cron-jobs-pagination-container">
+                    <div class="text-muted" style="font-size: 0.85rem;" id="cron-jobs-pagination-info">
+                        Mostrando 0 de 0 bases de datos
+                    </div>
+                    <nav aria-label="Navegación de jobs">
+                        <ul class="pagination pagination-sm mb-0" id="cron-jobs-pagination-list">
+                            <!-- Botones de paginación dinámicos -->
+                        </ul>
+                    </nav>
                 </div>
             </div>
 
@@ -1356,66 +1400,249 @@
                 document.getElementById('cron-kpi-saved').innerText = `${String(hrs).padStart(2, '0')}h ${String(mins).padStart(2, '0')}m`;
             }
 
-            // Renderizar Runs
+            // Renderizar Runs con paginación a 5 filas por página
+            allCronRuns = data.runs || [];
+            filterAndPaginateRuns(1);
+
+            // Renderizar Jobs de la última ejecución con Paginación a 5 filas y Filtro por Estado
+            allCronJobs = data.jobs || [];
+            filterAndPaginateJobs(1);
+        }
+
+        // ==========================================
+        // PAGINACIÓN DE RUNS NOCTURNOS (5 FILAS POR PÁGINA)
+        // ==========================================
+        let allCronRuns = [];
+        let currentRunsPage = 1;
+        const runsPageSize = 5;
+
+        function filterAndPaginateRuns(page = 1) {
+            currentRunsPage = page;
             const runsTbody = document.getElementById('cron-runs-table-body');
+            const paginationInfo = document.getElementById('cron-runs-pagination-info');
+            const paginationList = document.getElementById('cron-runs-pagination-list');
+
+            if (!runsTbody) return;
             runsTbody.innerHTML = '';
+            if (paginationList) paginationList.innerHTML = '';
 
-            if (!data.runs || data.runs.length === 0) {
-                runsTbody.innerHTML = '<tr><td colspan="9" class="text-center py-4 text-muted">Aún no hay ejecuciones registradas.</td></tr>';
-            } else {
-                data.runs.forEach(r => {
-                    const tr = document.createElement('tr');
-                    const badgeClass = r.status === 'completed' ? 'badge-ok' : (r.status === 'running' ? 'badge-active' : 'badge-err');
-                    tr.innerHTML = `
-                        <td><strong>#${r.id}</strong></td>
-                        <td>${r.started_at || '—'}</td>
-                        <td>${r.finished_at || '—'}</td>
-                        <td><span class="badge-custom ${badgeClass}">${(r.status || '').toUpperCase()}</span></td>
-                        <td class="fw-bold">${r.total_databases}</td>
-                        <td class="text-success fw-bold">${r.skipped_databases}</td>
-                        <td class="text-primary fw-bold">${r.successful_databases}</td>
-                        <td class="text-danger fw-bold">${r.failed_databases}</td>
-                        <td>${r.total_duration_seconds} seg</td>
-                    `;
-                    runsTbody.appendChild(tr);
-                });
+            const totalItems = allCronRuns.length;
+            const totalPages = Math.ceil(totalItems / runsPageSize) || 1;
+            currentRunsPage = Math.max(1, Math.min(currentRunsPage, totalPages));
+
+            if (totalItems === 0) {
+                runsTbody.innerHTML = '<tr><td colspan="9" class="text-center py-4 text-muted">Aún no hay ejecuciones nocturnas registradas.</td></tr>';
+                if (paginationInfo) paginationInfo.innerText = 'Mostrando 0 de 0 ejecuciones nocturnas';
+                return;
             }
 
-            // Renderizar Jobs de la última ejecución
+            const start = (currentRunsPage - 1) * runsPageSize;
+            const end = Math.min(start + runsPageSize, totalItems);
+            const pageItems = allCronRuns.slice(start, end);
+
+            if (paginationInfo) {
+                paginationInfo.innerHTML = `Mostrando <strong class="text-white">${start + 1}</strong> a <strong class="text-white">${end}</strong> de <strong class="text-white">${totalItems}</strong> ejecuciones nocturnas`;
+            }
+
+            pageItems.forEach(r => {
+                const tr = document.createElement('tr');
+                const badgeClass = r.status === 'completed' ? 'badge-ok' : (r.status === 'running' ? 'badge-active' : 'badge-err');
+                tr.innerHTML = `
+                    <td><strong>#${r.id}</strong></td>
+                    <td>${r.started_at || '—'}</td>
+                    <td>${r.finished_at || '—'}</td>
+                    <td><span class="badge-custom ${badgeClass}">${(r.status || '').toUpperCase()}</span></td>
+                    <td class="fw-bold">${r.total_databases}</td>
+                    <td class="text-success fw-bold">${r.skipped_databases}</td>
+                    <td class="text-primary fw-bold">${r.successful_databases}</td>
+                    <td class="text-danger fw-bold">${r.failed_databases}</td>
+                    <td>${r.total_duration_seconds} seg</td>
+                `;
+                runsTbody.appendChild(tr);
+            });
+
+            if (paginationList) {
+                const prevLi = document.createElement('li');
+                prevLi.className = `page-item ${currentRunsPage === 1 ? 'disabled' : ''}`;
+                prevLi.innerHTML = `<a class="page-link" href="javascript:void(0)" onclick="filterAndPaginateRuns(${currentRunsPage - 1})">◀ Anterior</a>`;
+                paginationList.appendChild(prevLi);
+
+                for (let i = 1; i <= totalPages; i++) {
+                    const li = document.createElement('li');
+                    li.className = `page-item ${i === currentRunsPage ? 'active' : ''}`;
+                    li.innerHTML = `<a class="page-link" href="javascript:void(0)" onclick="filterAndPaginateRuns(${i})">${i}</a>`;
+                    paginationList.appendChild(li);
+                }
+
+                const nextLi = document.createElement('li');
+                nextLi.className = `page-item ${currentRunsPage === totalPages ? 'disabled' : ''}`;
+                nextLi.innerHTML = `<a class="page-link" href="javascript:void(0)" onclick="filterAndPaginateRuns(${currentRunsPage + 1})">Siguiente ▶</a>`;
+                paginationList.appendChild(nextLi);
+            }
+        }
+
+        // ==========================================
+        // PAGINACIÓN Y FILTRADO DE DATABASE_SYNC_JOBS (5 FILAS POR PÁGINA)
+        // ==========================================
+        let allCronJobs = [];
+        let currentJobsPage = 1;
+        const jobsPageSize = 5;
+        let currentJobsFilter = 'all';
+
+        function onJobsFilterChange(filterValue) {
+            currentJobsFilter = filterValue;
+            filterAndPaginateJobs(1);
+        }
+
+        function filterAndPaginateJobs(page = 1) {
+            currentJobsPage = page;
             const jobsTbody = document.getElementById('cron-jobs-table-body');
+            const paginationInfo = document.getElementById('cron-jobs-pagination-info');
+            const paginationList = document.getElementById('cron-jobs-pagination-list');
+            
+            if (!jobsTbody) return;
             jobsTbody.innerHTML = '';
+            if (paginationList) paginationList.innerHTML = '';
 
-            if (!data.jobs || data.jobs.length === 0) {
-                jobsTbody.innerHTML = '<tr><td colspan="6" class="text-center py-4 text-muted">No hay ejecuciones de jobs individuales aún.</td></tr>';
-            } else {
-                data.jobs.forEach(j => {
-                    const tr = document.createElement('tr');
-                    let statusBadge = '';
-                    if (j.status === 'skipped_unchanged') {
-                        statusBadge = '<span class="badge-custom badge-warning-custom"><i class="bi bi-shield-check me-1"></i> SKIPPED_UNCHANGED</span>';
-                    } else if (j.status === 'completed') {
-                        statusBadge = '<span class="badge-custom badge-ok"><i class="bi bi-check-circle me-1"></i> COMPLETED</span>';
-                    } else if (j.status === 'failed') {
-                        statusBadge = '<span class="badge-custom badge-err"><i class="bi bi-x-circle me-1"></i> FAILED</span>';
-                    } else {
-                        statusBadge = `<span class="badge-custom badge-active">${(j.status || '').toUpperCase()}</span>`;
-                    }
-
-                    const prevSig = j.previous_metadata_signature ? j.previous_metadata_signature.substring(0, 14) + '...' : '—';
-                    const currSig = j.metadata_signature ? j.metadata_signature.substring(0, 14) + '...' : '—';
-                    const sizeStr = formatBytesJS(parseInt(j.source_size_bytes || 0));
-
-                    tr.innerHTML = `
-                        <td><strong class="text-white">${j.database_name}</strong></td>
-                        <td>${statusBadge}</td>
-                        <td><code>${prevSig}</code></td>
-                        <td><code class="text-cyan">${currSig}</code></td>
-                        <td>${sizeStr}</td>
-                        <td class="text-muted" style="font-size: 0.85rem;">${j.skip_reason || j.error_message || '—'}</td>
-                    `;
-                    jobsTbody.appendChild(tr);
-                });
+            // 1. Aplicar Filtro de Estado
+            let filteredJobs = allCronJobs;
+            if (currentJobsFilter !== 'all') {
+                filteredJobs = allCronJobs.filter(j => j.status === currentJobsFilter);
             }
+
+            const totalItems = filteredJobs.length;
+            const totalPages = Math.ceil(totalItems / jobsPageSize) || 1;
+            currentJobsPage = Math.max(1, Math.min(currentJobsPage, totalPages));
+
+            if (totalItems === 0) {
+                jobsTbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 text-muted">No se encontraron registros para el filtro seleccionado.</td></tr>';
+                if (paginationInfo) paginationInfo.innerText = 'Mostrando 0 a 0 de 0 bases de datos';
+                return;
+            }
+
+            const start = (currentJobsPage - 1) * jobsPageSize;
+            const end = Math.min(start + jobsPageSize, totalItems);
+            const pageItems = filteredJobs.slice(start, end);
+
+            if (paginationInfo) {
+                paginationInfo.innerHTML = `Mostrando <strong class="text-white">${start + 1}</strong> a <strong class="text-white">${end}</strong> de <strong class="text-white">${totalItems}</strong> bases de datos (Filtro: ${currentJobsFilter.toUpperCase()})`;
+            }
+
+            // 2. Renderizar Filas de la Página Actual (Máximo 5 filas)
+            pageItems.forEach(j => {
+                const tr = document.createElement('tr');
+                let statusBadge = '';
+                if (j.status === 'skipped_unchanged') {
+                    statusBadge = '<span class="badge-custom badge-warning-custom"><i class="bi bi-shield-check me-1"></i> SKIPPED_UNCHANGED</span>';
+                } else if (j.status === 'completed') {
+                    statusBadge = '<span class="badge-custom badge-ok"><i class="bi bi-check-circle me-1"></i> COMPLETED</span>';
+                } else if (j.status === 'failed') {
+                    statusBadge = '<span class="badge-custom badge-err"><i class="bi bi-x-circle me-1"></i> FAILED</span>';
+                } else {
+                    statusBadge = `<span class="badge-custom badge-active">${(j.status || '').toUpperCase()}</span>`;
+                }
+
+                // Información de la última sincronización manual
+                let manualSyncBadge = '<span class="text-muted" style="font-size: 0.78rem;"><i class="bi bi-dash-circle me-1"></i> Nunca sincronizado</span>';
+                if (j.ultimo_sync_manual) {
+                    const mState = j.ultimo_sync_manual.estado || 'desconocido';
+                    const mPct = j.ultimo_sync_manual.porcentaje ?? 0;
+                    const mDate = j.ultimo_sync_manual.fecha ? j.ultimo_sync_manual.fecha.substring(0, 16) : '';
+                    
+                    let mBadgeClass = 'badge-warning-custom';
+                    let mIcon = 'bi-exclamation-triangle';
+                    if (mState === 'completado' || mPct >= 100) {
+                        mBadgeClass = 'badge-ok';
+                        mIcon = 'bi-check-circle';
+                    } else if (mState === 'fallido') {
+                        mBadgeClass = 'badge-err';
+                        mIcon = 'bi-x-circle';
+                    }
+                    
+                    manualSyncBadge = `
+                        <span class="badge-custom ${mBadgeClass}" style="font-size: 0.75rem;">
+                            <i class="bi ${mIcon} me-1"></i> ${mState.toUpperCase()} (${mPct}%)
+                        </span>
+                        ${mDate ? `<br><small class="text-muted" style="font-size: 0.73rem;">${mDate}</small>` : ''}
+                    `;
+                }
+
+                const prevSig = j.previous_metadata_signature ? j.previous_metadata_signature.substring(0, 14) + '...' : '—';
+                const currSig = j.metadata_signature ? j.metadata_signature.substring(0, 14) + '...' : '—';
+                const sizeStr = formatBytesJS(parseInt(j.source_size_bytes || 0));
+
+                tr.innerHTML = `
+                    <td><strong class="text-white">${j.database_name}</strong></td>
+                    <td>${statusBadge}</td>
+                    <td>${manualSyncBadge}</td>
+                    <td><code>${prevSig}</code></td>
+                    <td><code class="text-cyan">${currSig}</code></td>
+                    <td>${sizeStr}</td>
+                    <td class="col-reason text-muted">${j.skip_reason || j.error_message || '—'}</td>
+                `;
+                jobsTbody.appendChild(tr);
+            });
+
+            // 3. Renderizar Controles de Paginación para Jobs
+            if (paginationList) {
+                const prevLi = document.createElement('li');
+                prevLi.className = `page-item ${currentJobsPage === 1 ? 'disabled' : ''}`;
+                prevLi.innerHTML = `<a class="page-link" href="javascript:void(0)" onclick="filterAndPaginateJobs(${currentJobsPage - 1})">◀ Anterior</a>`;
+                paginationList.appendChild(prevLi);
+
+                for (let i = 1; i <= totalPages; i++) {
+                    const li = document.createElement('li');
+                    li.className = `page-item ${i === currentJobsPage ? 'active' : ''}`;
+                    li.innerHTML = `<a class="page-link" href="javascript:void(0)" onclick="filterAndPaginateJobs(${i})">${i}</a>`;
+                    paginationList.appendChild(li);
+                }
+
+                const nextLi = document.createElement('li');
+                nextLi.className = `page-item ${currentJobsPage === totalPages ? 'disabled' : ''}`;
+                nextLi.innerHTML = `<a class="page-link" href="javascript:void(0)" onclick="filterAndPaginateJobs(${currentJobsPage + 1})">Siguiente ▶</a>`;
+                paginationList.appendChild(nextLi);
+            }
+        }
+
+        // ==========================================
+        // REVALIDACIÓN Y REFRESCO DE METADATA PARA BASES FALLIDAS
+        // ==========================================
+        function revalidarEstadoJob(jobId, databaseName, btnElement) {
+            if (!confirm(`¿Deseas revalidar el estado de la base de datos '${databaseName}'?\nSe evaluará su última sincronización manual y su firma metadata actual.`)) {
+                return;
+            }
+
+            const originalText = btnElement ? btnElement.innerHTML : '';
+            if (btnElement) {
+                btnElement.disabled = true;
+                btnElement.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span> Validando...';
+            }
+
+            fetch(`index.php?action=revalidar_job_metadata&job_id=${jobId}&database=${encodeURIComponent(databaseName)}`)
+                .then(r => r.json())
+                .then(res => {
+                    if (res.success) {
+                        let extraMsg = '';
+                        if (res.data && res.data.manual_sync_info) {
+                            extraMsg = `\n\nÚltima Sync Manual verificada: ${res.data.manual_sync_info.porcentaje}% (${res.data.manual_sync_info.fecha || 'Sin fecha'}).`;
+                        }
+                        alert(`¡Base de datos '${databaseName}' revalidada con éxito!${extraMsg}\nEstado actualizado a COMPLETED y resumen global sincronizado.`);
+                        loadCronData(); // Recarga ejecuciones nocturnas, jobs y actualiza contadores KPI
+                    } else {
+                        alert(`Error al revalidar la base de datos: ${res.error}`);
+                        if (btnElement) {
+                            btnElement.disabled = false;
+                            btnElement.innerHTML = originalText;
+                        }
+                    }
+                })
+                .catch(err => {
+                    alert('Error de comunicación con el servidor: ' + err);
+                    if (btnElement) {
+                        btnElement.disabled = false;
+                        btnElement.innerHTML = originalText;
+                    }
+                });
         }
 
         function loadCronLog() {

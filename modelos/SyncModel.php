@@ -439,7 +439,7 @@ class SyncModel {
         ");
         $states = $stmtState->fetchAll(PDO::FETCH_ASSOC);
 
-        // 3. Obtener detalle de jobs de la última corrida si existe
+        // 3. Obtener detalle de jobs de la última corrida si existe y adjuntar información de la última sync manual
         $latestRunId = !empty($runs) ? (int)$runs[0]['id'] : null;
         $jobs = [];
         if ($latestRunId !== null) {
@@ -453,7 +453,51 @@ class SyncModel {
                 ORDER BY id ASC
             ");
             $stmtJobs->execute(['run_id' => $latestRunId]);
-            $jobs = $stmtJobs->fetchAll(PDO::FETCH_ASSOC);
+            $rawJobs = $stmtJobs->fetchAll(PDO::FETCH_ASSOC);
+
+            // Preparar consulta para buscar la última sincronización manual desde sync_jobs por cada esquema
+            $stmtManual = $destino->prepare("
+                SELECT id, cliente_id, schema_name, estado, total_tablas, tablas_completadas, error_mensaje, fecha_inicio, fecha_fin
+                FROM sync_jobs
+                WHERE LOWER(schema_name) = LOWER(:schema) 
+                   OR LOWER(schema_name) = LOWER(:dbname)
+                ORDER BY id DESC
+                LIMIT 1
+            ");
+
+            foreach ($rawJobs as $j) {
+                $dbName = $j['database_name'];
+                $cleanSchema = str_replace('fugzcdpo_', '', strtolower($dbName));
+                
+                $stmtManual->execute([
+                    'schema' => $cleanSchema,
+                    'dbname' => strtolower($dbName)
+                ]);
+                $manualJob = $stmtManual->fetch(PDO::FETCH_ASSOC);
+
+                if ($manualJob) {
+                    $totTab = (int)($manualJob['total_tablas'] ?? 0);
+                    $compTab = (int)($manualJob['tablas_completadas'] ?? 0);
+                    $pct = ($totTab > 0) ? (int)round(($compTab / $totTab) * 100) : 0;
+                    if ($manualJob['estado'] === 'completado' && $pct < 100) {
+                        $pct = 100;
+                    }
+
+                    $j['ultimo_sync_manual'] = [
+                        'id' => (int)$manualJob['id'],
+                        'estado' => $manualJob['estado'],
+                        'total_tablas' => $totTab,
+                        'tablas_completadas' => $compTab,
+                        'porcentaje' => $pct,
+                        'fecha' => $manualJob['fecha_fin'] ?? $manualJob['fecha_inicio'],
+                        'error' => $manualJob['error_mensaje']
+                    ];
+                } else {
+                    $j['ultimo_sync_manual'] = null;
+                }
+
+                $jobs[] = $j;
+            }
         }
 
         return [
@@ -462,6 +506,159 @@ class SyncModel {
             'jobs' => $jobs,
             'states' => $states
         ];
+    }
+
+    /**
+     * Re-evalúa los metadatos de una base de datos específica basándose en la última sincronización manual
+     * y actualiza database_sync_jobs, database_sync_state y recalcula los contadores globales en database_sync_runs.
+     */
+    public static function revalidarJobMetadata(?int $jobId, ?string $databaseName): array {
+        $destino = Database::getDestinoConnection();
+
+        // 1. Obtener la fila del job desde database_sync_jobs
+        if ($jobId !== null && $jobId > 0) {
+            $stmt = $destino->prepare("SELECT * FROM database_sync_jobs WHERE id = :id");
+            $stmt->execute(['id' => $jobId]);
+            $job = $stmt->fetch();
+        } else {
+            $stmt = $destino->prepare("SELECT * FROM database_sync_jobs WHERE database_name = :db ORDER BY id DESC LIMIT 1");
+            $stmt->execute(['db' => $databaseName]);
+            $job = $stmt->fetch();
+        }
+
+        if (!$job) {
+            throw new Exception("No se encontró el registro de sincronización en database_sync_jobs.");
+        }
+
+        $jobId = (int)$job['id'];
+        $runId = (int)$job['run_id'];
+        $dbName = $job['database_name'];
+        $cleanSchema = str_replace('fugzcdpo_', '', strtolower($dbName));
+
+        // 2. Buscar la última sincronización manual en sync_jobs para esta base
+        $stmtManual = $destino->prepare("
+            SELECT id, cliente_id, schema_name, estado, total_tablas, tablas_completadas, error_mensaje, fecha_inicio, fecha_fin
+            FROM sync_jobs
+            WHERE LOWER(schema_name) = LOWER(:schema) 
+               OR LOWER(schema_name) = LOWER(:dbname)
+            ORDER BY id DESC
+            LIMIT 1
+        ");
+        $stmtManual->execute(['schema' => $cleanSchema, 'dbname' => strtolower($dbName)]);
+        $manualJob = $stmtManual->fetch(PDO::FETCH_ASSOC);
+
+        $pctManual = 0;
+        $fechaManual = '';
+        if ($manualJob) {
+            $totTab = (int)($manualJob['total_tablas'] ?? 0);
+            $compTab = (int)($manualJob['tablas_completadas'] ?? 0);
+            $pctManual = ($totTab > 0) ? (int)round(($compTab / $totTab) * 100) : 0;
+            if ($manualJob['estado'] === 'completado' && $pctManual < 100) {
+                $pctManual = 100;
+            }
+            $fechaManual = $manualJob['fecha_fin'] ?? $manualJob['fecha_inicio'] ?? '';
+        }
+
+        // 3. Conectar a Origen para evaluar metadatos actuales
+        $origenPdo = Database::getClienteConnection($dbName, 'origen');
+        $currentMetadata = DatabaseMetadataService::getDatabaseMetadata($origenPdo, $dbName);
+
+        // 4. Registrar sincronización exitosa en database_sync_state
+        DatabaseMetadataService::recordSuccessfulSync($destino, $runId, $dbName, $currentMetadata);
+
+        // 5. Construir razón de salto / detalle explicativo
+        $skipReason = "Validado manualmente";
+        if ($manualJob) {
+            $skipReason = "Validado por sync manual ({$pctManual}% el {$fechaManual})";
+        }
+
+        // 6. Actualizar el registro en database_sync_jobs a 'completed'
+        $stmtUpd = $destino->prepare("
+            UPDATE database_sync_jobs 
+            SET status = 'completed',
+                metadata_signature = :sig,
+                change_detected = 0,
+                skip_reason = :reason,
+                error_message = NULL,
+                finished_at = NOW(),
+                source_size_bytes = :size,
+                table_count = :tables,
+                estimated_rows = :rows
+            WHERE id = :id
+        ");
+        $stmtUpd->execute([
+            'sig' => $currentMetadata['metadata_signature'],
+            'reason' => $skipReason,
+            'size' => $currentMetadata['total_size_bytes'],
+            'tables' => $currentMetadata['table_count'],
+            'rows' => $currentMetadata['total_rows_estimated'],
+            'id' => $jobId
+        ]);
+
+        // 7. Recalcular resumen en database_sync_runs para la ejecución (run_id)
+        self::recalcularSyncRunSummary($destino, $runId);
+
+        return [
+            'job_id' => $jobId,
+            'run_id' => $runId,
+            'database' => $dbName,
+            'new_status' => 'completed',
+            'signature' => $currentMetadata['metadata_signature'],
+            'manual_sync_info' => $manualJob ? [
+                'porcentaje' => $pctManual,
+                'fecha' => $fechaManual,
+                'estado' => $manualJob['estado']
+            ] : null
+        ];
+    }
+
+    /**
+     * Recalcula y actualiza los contadores globales en database_sync_runs para una ejecución específica.
+     */
+    public static function recalcularSyncRunSummary(PDO $destino, int $runId): void {
+        $stmtJobs = $destino->prepare("
+            SELECT status, COUNT(*) as cnt 
+            FROM database_sync_jobs 
+            WHERE run_id = :run_id 
+            GROUP BY status
+        ");
+        $stmtJobs->execute(['run_id' => $runId]);
+        $rows = $stmtJobs->fetchAll(PDO::FETCH_ASSOC);
+
+        $completed = 0;
+        $skipped = 0;
+        $failed = 0;
+
+        foreach ($rows as $r) {
+            $cnt = (int)$r['cnt'];
+            $st = strtolower($r['status']);
+            if ($st === 'completed') {
+                $completed += $cnt;
+            } else if ($st === 'skipped_unchanged') {
+                $skipped += $cnt;
+            } else if ($st === 'failed') {
+                $failed += $cnt;
+            }
+        }
+
+        $newRunStatus = ($failed === 0) ? 'completed' : 'completed_with_errors';
+
+        $stmtUpdRun = $destino->prepare("
+            UPDATE database_sync_runs 
+            SET successful_databases = :comp,
+                skipped_databases = :skip,
+                failed_databases = :fail,
+                status = :status,
+                updated_at = NOW()
+            WHERE id = :run_id
+        ");
+        $stmtUpdRun->execute([
+            'comp' => $completed,
+            'skip' => $skipped,
+            'fail' => $failed,
+            'status' => $newRunStatus,
+            'run_id' => $runId
+        ]);
     }
 
     /**

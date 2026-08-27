@@ -72,7 +72,7 @@ function runAutomaticSync(string $triggerType = 'cron'): array {
         if ($origenConnMain) {
             try {
                 $stmtDisc = $origenConnMain->query("
-                    SELECT LOWER(SCHEMA_NAME) AS db_name 
+                    SELECT SCHEMA_NAME AS db_name 
                     FROM INFORMATION_SCHEMA.SCHEMATA 
                     WHERE LOWER(SCHEMA_NAME) LIKE 'fugzcdpo_%'
                     ORDER BY SCHEMA_NAME ASC
@@ -80,8 +80,8 @@ function runAutomaticSync(string $triggerType = 'cron'): array {
                 $rowsDisc = $stmtDisc->fetchAll(PDO::FETCH_COLUMN);
                 $systemDbs = ['information_schema', 'mysql', 'performance_schema', 'sys', 'snuquality', 'snuqualityapp', 'snuqualityapp_wordpress'];
                 foreach ($rowsDisc as $r) {
-                    $db = strtolower(trim($r));
-                    if (!in_array($db, $systemDbs, true) && preg_match('/^fugzcdpo_[a-zA-Z0-9_]+$/', $db)) {
+                    $db = trim($r);
+                    if (!in_array(strtolower($db), $systemDbs, true) && preg_match('/^fugzcdpo_[a-zA-Z0-9_]+$/i', $db)) {
                         $databases[] = $db;
                     }
                 }
@@ -185,22 +185,29 @@ function runAutomaticSync(string $triggerType = 'cron'): array {
             $destinoPdo->exec("SET UNIQUE_CHECKS = 0;");
             $destinoPdo->exec("SET SQL_MODE = '';");
 
-            // 4. Sincronizar todas las tablas excluyendo 'estadisticasUso'
+            // 4. Sincronizar todas las tablas excluyendo 'estadisticasUso' y tablas de control del migrador
             $stmtTablas = $origenPdo->query("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'");
             $tablas = [];
+            $controlTables = ['sync_jobs', 'sync_progress', 'sync_logs', 'database_sync_runs', 'database_sync_jobs', 'database_sync_state'];
+            
             while ($row = $stmtTablas->fetch(PDO::FETCH_NUM)) {
                 $tName = $row[0];
-                if (!DatabaseMetadataService::isExcludedTable($tName)) {
+                if (!DatabaseMetadataService::isExcludedTable($tName) && !in_array(strtolower($tName), $controlTables, true)) {
                     $tablas[] = $tName;
                 }
             }
 
-            // A. Primero crear todas las estructuras de las tablas
+            // Sincronizar estructura y datos de cada tabla de forma limpia por tabla
             foreach ($tablas as $tabla) {
+                // A. Garantizar que la estructura existe en destino
                 try {
                     $destinoPdo->query("SELECT 1 FROM `$tabla` LIMIT 1");
-                    $destinoPdo->exec("TRUNCATE TABLE `$tabla`;");
+                    $tablaExiste = true;
                 } catch (Exception $exPrep) {
+                    $tablaExiste = false;
+                }
+
+                if (!$tablaExiste) {
                     $stmtCreate = $origenPdo->query("SHOW CREATE TABLE `$tabla`");
                     $createSql = $stmtCreate->fetch()['Create Table'];
                     
@@ -210,11 +217,13 @@ function runAutomaticSync(string $triggerType = 'cron'): array {
                     $createSql = preg_replace('/utf8mb4_0[89]\d\d_[a-z0-9_]+/i', 'utf8mb4_unicode_ci', $createSql);
 
                     $destinoPdo->exec($createSql);
+                } else {
+                    // Sincronizar columnas para agregar faltantes como 'sistema_id'
+                    syncTableColumnsWorker($origenPdo, $destinoPdo, $tabla);
+                    $destinoPdo->exec("TRUNCATE TABLE `$tabla`;");
                 }
-            }
 
-            // B. Copiar registros por bloques
-            foreach ($tablas as $tabla) {
+                // B. Copiar registros por bloques
                 $stmtCount = $origenPdo->query("SELECT COUNT(*) FROM `$tabla` ");
                 $totalReg = (int)$stmtCount->fetchColumn();
 
@@ -226,17 +235,68 @@ function runAutomaticSync(string $triggerType = 'cron'): array {
                         $rowsData = $stmtFetch->fetchAll(PDO::FETCH_ASSOC);
 
                         if (!empty($rowsData)) {
-                            $destinoPdo->beginTransaction();
-                            $cols = array_map(fn($c) => "`$c`", array_keys($rowsData[0]));
-                            $sql = "INSERT INTO `$tabla` (" . implode(', ', $cols) . ") VALUES (" . implode(', ', array_fill(0, count($cols), '?')) . ")";
-                            $stmtIns = $destinoPdo->prepare($sql);
-                            foreach ($rowsData as $r) {
-                                $stmtIns->execute(array_values($r));
+                            try {
+                                $destinoPdo->beginTransaction();
+                                $cols = array_map(fn($c) => "`$c`", array_keys($rowsData[0]));
+                                $sql = "INSERT INTO `$tabla` (" . implode(', ', $cols) . ") VALUES (" . implode(', ', array_fill(0, count($cols), '?')) . ")";
+                                $stmtIns = $destinoPdo->prepare($sql);
+                                foreach ($rowsData as $r) {
+                                    if (strtolower($tabla) === 'squemas' && isset($r['squema'])) {
+                                        $r['squema'] = strtolower($r['squema']);
+                                    }
+                                    $stmtIns->execute(array_values($r));
+                                }
+                                $destinoPdo->commit();
+                            } catch (Exception $exBatch) {
+                                if ($destinoPdo->inTransaction()) {
+                                    $destinoPdo->rollBack();
+                                }
+                                
+                                $msgB = strtolower($exBatch->getMessage());
+                                if (str_contains($msgB, 'unknown column') || str_contains($msgB, '1054')) {
+                                    syncTableColumnsWorker($origenPdo, $destinoPdo, $tabla);
+                                }
+
+                                if (Database::isServerGoneException($exBatch)) {
+                                    try {
+                                        $destinoPdo = Database::getClienteConnection($dbName, 'destino');
+                                        $destinoPdo->exec("SET SESSION max_allowed_packet = 1073741824;");
+                                    } catch (Exception $exReconn) {}
+                                }
+
+                                // Reintento fila por fila para aislar registros con problemas de tamaño o reconectar
+                                $cols = array_map(fn($c) => "`$c`", array_keys($rowsData[0]));
+                                $sql = "INSERT INTO `$tabla` (" . implode(', ', $cols) . ") VALUES (" . implode(', ', array_fill(0, count($cols), '?')) . ")";
+                                $stmtIns = $destinoPdo->prepare($sql);
+                                foreach ($rowsData as $r) {
+                                    if (strtolower($tabla) === 'squemas' && isset($r['squema'])) {
+                                        $r['squema'] = strtolower($r['squema']);
+                                    }
+                                    try {
+                                        $stmtIns->execute(array_values($r));
+                                    } catch (Exception $exRow) {
+                                        if (Database::isServerGoneException($exRow)) {
+                                            try {
+                                                $destinoPdo = Database::getClienteConnection($dbName, 'destino');
+                                                $destinoPdo->exec("SET SESSION max_allowed_packet = 1073741824;");
+                                                $stmtIns = $destinoPdo->prepare($sql);
+                                                $stmtIns->execute(array_values($r));
+                                            } catch (Exception $exFinal) {}
+                                        }
+                                    }
+                                }
                             }
-                            $destinoPdo->commit();
                         }
                         $offset += count($rowsData);
                         if (count($rowsData) === 0) break;
+                    }
+                }
+
+                // Verificación especial para tabla 'usuarios'
+                if (strtolower($tabla) === 'usuarios' && $totalReg > 0) {
+                    $stmtVerify = $destinoPdo->query("SELECT COUNT(*) FROM `usuarios`");
+                    if ((int)$stmtVerify->fetchColumn() === 0) {
+                        throw new Exception("La sincronización de la tabla 'usuarios' resultó en 0 registros en destino.");
                     }
                 }
             }
@@ -353,6 +413,54 @@ function runAutomaticSync(string $triggerType = 'cron'): array {
         'failed' => $failedCount,
         'duration_seconds' => $totalDuration
     ];
+}
+
+function syncTableColumnsWorker(PDO $origenPdo, PDO $destinoPdo, string $tabla): void {
+    try {
+        $stmtColsOrig = $origenPdo->query("SHOW FULL COLUMNS FROM `$tabla`");
+        $colsOrigen = $stmtColsOrig->fetchAll(PDO::FETCH_ASSOC);
+
+        $stmtColsDest = $destinoPdo->query("SHOW FULL COLUMNS FROM `$tabla`");
+        $colsDestino = $stmtColsDest->fetchAll(PDO::FETCH_ASSOC);
+
+        $destColMap = [];
+        foreach ($colsDestino as $c) {
+            $destColMap[strtolower($c['Field'])] = true;
+        }
+
+        $lastCol = null;
+        foreach ($colsOrigen as $col) {
+            $field = $col['Field'];
+            if (!isset($destColMap[strtolower($field)])) {
+                $type = $col['Type'];
+                $null = ($col['Null'] === 'NO') ? 'NOT NULL' : 'NULL';
+                $default = ($col['Default'] !== null) ? "DEFAULT " . $destinoPdo->quote($col['Default']) : '';
+                if ($col['Null'] === 'YES' && $col['Default'] === null) {
+                    $default = 'DEFAULT NULL';
+                }
+                $extra = $col['Extra'] ?? '';
+                $after = $lastCol ? "AFTER `$lastCol`" : "FIRST";
+
+                $sql = "ALTER TABLE `$tabla` ADD COLUMN `$field` $type $null $default $extra $after";
+                $destinoPdo->exec($sql);
+            }
+            $lastCol = $field;
+        }
+    } catch (Exception $e) {
+        try {
+            $stmtCreate = $origenPdo->query("SHOW CREATE TABLE `$tabla`");
+            $row = $stmtCreate->fetch();
+            $createSql = $row['Create Table'];
+            $createSql = preg_replace('/utf8mb4_0900_ai_ci/i', 'utf8mb4_unicode_ci', $createSql);
+            $createSql = preg_replace('/utf8mb4_0900_bin/i', 'utf8mb4_bin', $createSql);
+            $createSql = preg_replace('/utf8mb4_0[89]\d\d_[a-z0-9_]+/i', 'utf8mb4_unicode_ci', $createSql);
+
+            $destinoPdo->exec("SET FOREIGN_KEY_CHECKS = 0;");
+            $destinoPdo->exec("DROP TABLE IF EXISTS `$tabla`;");
+            $destinoPdo->exec($createSql);
+            $destinoPdo->exec("SET FOREIGN_KEY_CHECKS = 1;");
+        } catch (Exception $exRecreate) {}
+    }
 }
 
 // Ejecución directa CLI

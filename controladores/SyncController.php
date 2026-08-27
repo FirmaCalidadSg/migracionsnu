@@ -205,25 +205,8 @@ class SyncController {
             $registrosLeidos = count($registros);
 
             if ($registrosLeidos > 0) {
-                // 4. Inserción en lote (Fase 3) dentro de una transacción para máxima velocidad
-                $dbDestinoCliente->beginTransaction();
-                try {
-                    $columnas = array_keys($registros[0]);
-                    $columnasEscapadas = array_map(fn($col) => "`$col`", $columnas);
-                    $campos = implode(', ', $columnasEscapadas);
-                    $placeholders = implode(', ', array_fill(0, count($columnas), '?'));
-                    
-                    $sql = "INSERT INTO `$tabla` ($campos) VALUES ($placeholders)";
-                    $stmtInsert = $dbDestinoCliente->prepare($sql);
-
-                    foreach ($registros as $row) {
-                        $stmtInsert->execute(array_values($row));
-                    }
-                    $dbDestinoCliente->commit();
-                } catch (Exception $ex) {
-                    $dbDestinoCliente->rollBack();
-                    throw new Exception("Error al insertar lote en destino: " . $ex->getMessage());
-                }
+                // 4. Inserción en lote resiliente con recuperación ante 2006, 1153 y columnas faltantes (1054)
+                $this->insertarLoteConResiliencia($dbOrigenCliente, $dbDestinoCliente, $schema, $tabla, $registros);
             }
 
             // 5. Calcular nuevo offset y progreso
@@ -443,12 +426,95 @@ class SyncController {
     }
 
     /**
+     * Inserta un lote de registros en destino con recuperación automática ante fallos de conexión (2006/2013),
+     * límite de tamaño de paquete (1153) y columnas faltantes como 'sistema_id' (1054).
+     */
+    private function insertarLoteConResiliencia(PDO $dbOrigen, PDO &$dbDestino, string $schema, string $tabla, array $registros): void {
+        if (empty($registros)) return;
+
+        try {
+            $this->ejecutarInsercionLote($dbDestino, $tabla, $registros);
+        } catch (Exception $ex) {
+            $msg = strtolower($ex->getMessage());
+
+            // 1. Manejo de Columna Faltante (Error 1054 / Unknown column 'sistema_id')
+            if (str_contains($msg, 'unknown column') || str_contains($msg, '1054')) {
+                $this->sincronizarColumnasTabla($dbOrigen, $dbDestino, $tabla);
+                $this->ejecutarInsercionLote($dbDestino, $tabla, $registros);
+                return;
+            }
+
+            // 2. Manejo de Conexión Caída / Server Gone / Packet Size (2006, 2013, 1153)
+            if (Database::isServerGoneException($ex)) {
+                try {
+                    $dbDestino = Database::getClienteConnection($schema, 'destino');
+                    $dbDestino->exec("SET SESSION max_allowed_packet = 1073741824;");
+                } catch (Exception $exReconn) {}
+
+                $columnas = array_keys($registros[0]);
+                $columnasEscapadas = array_map(fn($col) => "`$col`", $columnas);
+                $campos = implode(', ', $columnasEscapadas);
+                $placeholders = implode(', ', array_fill(0, count($columnas), '?'));
+                $sql = "INSERT INTO `$tabla` ($campos) VALUES ($placeholders)";
+                
+                $stmtInsert = $dbDestino->prepare($sql);
+                foreach ($registros as $row) {
+                    try {
+                        $stmtInsert->execute(array_values($row));
+                    } catch (Exception $exRow) {
+                        if (Database::isServerGoneException($exRow)) {
+                            try {
+                                $dbDestino = Database::getClienteConnection($schema, 'destino');
+                                $dbDestino->exec("SET SESSION max_allowed_packet = 1073741824;");
+                                $stmtInsert = $dbDestino->prepare($sql);
+                                $stmtInsert->execute(array_values($row));
+                            } catch (Exception $eFinal) {}
+                        }
+                    }
+                }
+                return;
+            }
+
+            throw new Exception("Error al insertar lote en destino para tabla `$tabla`: " . $ex->getMessage());
+        }
+    }
+
+    private function ejecutarInsercionLote(PDO $dbDestino, string $tabla, array $registros): void {
+        $columnas = array_keys($registros[0]);
+        $columnasEscapadas = array_map(fn($col) => "`$col`", $columnas);
+        $campos = implode(', ', $columnasEscapadas);
+        $placeholders = implode(', ', array_fill(0, count($columnas), '?'));
+
+        $sql = "INSERT INTO `$tabla` ($campos) VALUES ($placeholders)";
+        
+        $dbDestino->beginTransaction();
+        try {
+            $stmtInsert = $dbDestino->prepare($sql);
+            foreach ($registros as $row) {
+                if (strtolower($tabla) === 'squemas' && isset($row['squema'])) {
+                    $row['squema'] = strtolower($row['squema']);
+                }
+                $stmtInsert->execute(array_values($row));
+            }
+            $dbDestino->commit();
+        } catch (Exception $ex) {
+            if ($dbDestino->inTransaction()) {
+                $dbDestino->rollBack();
+            }
+            throw $ex;
+        }
+    }
+
+    /**
      * Valida y prepara la estructura de la tabla en destino (Fase 2).
      */
     private function prepararTablaDestino(PDO $dbOrigen, PDO $dbDestino, string $tabla): void {
         if (DatabaseMetadataService::isExcludedTable($tabla)) {
             return;
         }
+
+        try { $dbOrigen->exec("SET SESSION max_allowed_packet = 1073741824;"); } catch (Exception $e) {}
+        try { $dbDestino->exec("SET SESSION max_allowed_packet = 1073741824;"); } catch (Exception $e) {}
 
         // Verificar si la tabla existe en destino de forma ultra compatible
         try {
@@ -472,6 +538,9 @@ class SyncController {
             // Ejecutar creación en destino
             $dbDestino->exec($createSql);
         } else {
+            // Sincronizar columnas para agregar las faltantes en Destino (ej: 'sistema_id')
+            $this->sincronizarColumnasTabla($dbOrigen, $dbDestino, $tabla);
+
             // Si la tabla ya existe, la vaciamos (clean truncate)
             $dbDestino->exec("SET FOREIGN_KEY_CHECKS = 0;");
             $dbDestino->exec("TRUNCATE TABLE `$tabla`;");
@@ -480,7 +549,61 @@ class SyncController {
     }
 
     /**
-     * Sincroniza el catálogo de clientes y esquemas desde la base de datos de origen a la de destino.
+     * Compara y sincroniza las columnas de una tabla entre Origen y Destino.
+     * Agrega a Destino cualquier columna existente en Origen que no exista en Destino (ej: 'sistema_id').
+     */
+    private function sincronizarColumnasTabla(PDO $dbOrigen, PDO $dbDestino, string $tabla): void {
+        try {
+            $stmtColsOrig = $dbOrigen->query("SHOW FULL COLUMNS FROM `$tabla`");
+            $colsOrigen = $stmtColsOrig->fetchAll(PDO::FETCH_ASSOC);
+
+            $stmtColsDest = $dbDestino->query("SHOW FULL COLUMNS FROM `$tabla`");
+            $colsDestino = $stmtColsDest->fetchAll(PDO::FETCH_ASSOC);
+
+            $destColMap = [];
+            foreach ($colsDestino as $c) {
+                $destColMap[strtolower($c['Field'])] = true;
+            }
+
+            $lastCol = null;
+            foreach ($colsOrigen as $col) {
+                $field = $col['Field'];
+                if (!isset($destColMap[strtolower($field)])) {
+                    $type = $col['Type'];
+                    $null = ($col['Null'] === 'NO') ? 'NOT NULL' : 'NULL';
+                    $default = ($col['Default'] !== null) ? "DEFAULT " . $dbDestino->quote($col['Default']) : '';
+                    if ($col['Null'] === 'YES' && $col['Default'] === null) {
+                        $default = 'DEFAULT NULL';
+                    }
+                    $extra = $col['Extra'] ?? '';
+                    $after = $lastCol ? "AFTER `$lastCol`" : "FIRST";
+
+                    $sql = "ALTER TABLE `$tabla` ADD COLUMN `$field` $type $null $default $extra $after";
+                    $dbDestino->exec($sql);
+                }
+                $lastCol = $field;
+            }
+        } catch (Exception $e) {
+            // Si falla la alteración granular, forzar recreación limpia de la tabla para alinear estructura completa
+            try {
+                $stmtCreate = $dbOrigen->query("SHOW CREATE TABLE `$tabla`");
+                $row = $stmtCreate->fetch();
+                $createSql = $row['Create Table'];
+                $createSql = preg_replace('/utf8mb4_0900_ai_ci/i', 'utf8mb4_unicode_ci', $createSql);
+                $createSql = preg_replace('/utf8mb4_0900_bin/i', 'utf8mb4_bin', $createSql);
+                $createSql = preg_replace('/utf8mb4_0[89]\d\d_[a-z0-9_]+/i', 'utf8mb4_unicode_ci', $createSql);
+
+                $dbDestino->exec("SET FOREIGN_KEY_CHECKS = 0;");
+                $dbDestino->exec("DROP TABLE IF EXISTS `$tabla`;");
+                $dbDestino->exec($createSql);
+                $dbDestino->exec("SET FOREIGN_KEY_CHECKS = 1;");
+            } catch (Exception $exRecreate) {}
+        }
+    }
+
+    /**
+     * Sincroniza el catálogo de clientes, esquemas y tablas administrativas (usuarios, rols, etc.)
+     * desde la base de datos de origen a la de destino, garantizando que nunca quede vacía.
      */
     public function sincronizarCatalogo(): void {
         header('Content-Type: application/json');
@@ -488,20 +611,59 @@ class SyncController {
             $dbOrigen = Database::getOrigenConnection();
             $dbDestino = Database::getDestinoConnection();
 
-            // 1. Sincronizar la estructura de las tablas de catálogo si no existen en destino
-            $this->prepararTablaDestino($dbOrigen, $dbDestino, 'clientes');
-            $this->prepararTablaDestino($dbOrigen, $dbDestino, 'squemas');
+            // Tablas de control de la app de migración que NUNCA deben sobrescribirse en destino
+            $tablasExcluidasControl = [
+                'sync_jobs',
+                'sync_progress',
+                'sync_logs',
+                'database_sync_runs',
+                'database_sync_jobs',
+                'database_sync_state'
+            ];
 
-            // 2. Replicar los registros de la tabla 'clientes'
-            $this->replicarTablaCatalogo($dbOrigen, $dbDestino, 'clientes');
+            // 1. Obtener la lista de tablas base administrativas en Origen (fugzcdpo_snu)
+            $stmtTablas = $dbOrigen->query("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'");
+            $tablasAdmin = [];
+            while ($row = $stmtTablas->fetch(PDO::FETCH_NUM)) {
+                $tName = $row[0];
+                if (!in_array(strtolower($tName), $tablasExcluidasControl, true)) {
+                    $tablasAdmin[] = $tName;
+                }
+            }
 
-            // 3. Replicar los registros de la tabla 'squemas'
-            $this->replicarTablaCatalogo($dbOrigen, $dbDestino, 'squemas');
+            // Si por algún motivo la consulta dinámica estuviera vacía, usar lista base
+            if (empty($tablasAdmin)) {
+                $tablasAdmin = ['clientes', 'squemas', 'usuarios', 'rols'];
+            }
 
-            // 4. Sincronizar y asociar catálogo de bases de clientes MariaDB con Virtualmin (NO crea bases, solo asocia existentes)
+            // Priorizar 'clientes', 'squemas', 'rols', 'usuarios' al inicio si existen
+            $prioritarias = ['clientes', 'squemas', 'rols', 'usuarios'];
+            usort($tablasAdmin, function($a, $b) use ($prioritarias) {
+                $idxA = array_search(strtolower($a), $prioritarias, true);
+                $idxB = array_search(strtolower($b), $prioritarias, true);
+                $valA = ($idxA !== false) ? $idxA : 999;
+                $valB = ($idxB !== false) ? $idxB : 999;
+                return $valA <=> $valB;
+            });
+
+            // 2. Preparar estructura y replicar registros para cada tabla administrativa
+            $tablasProcesadas = [];
+            foreach ($tablasAdmin as $tabla) {
+                $this->prepararTablaDestino($dbOrigen, $dbDestino, $tabla);
+                $this->replicarTablaCatalogo($dbOrigen, $dbDestino, $tabla);
+                $tablasProcesadas[] = $tabla;
+            }
+
+            // 3. Sincronizar y asociar catálogo de bases de clientes MariaDB con Virtualmin
             $resSync = DatabaseProvisioningService::syncDatabaseCatalog('snuquality.tech', 'fugzcdpo_snu');
 
-            echo json_encode($resSync);
+            echo json_encode([
+                'success' => true,
+                'status' => 'success',
+                'message' => 'Catálogo y tablas administrativas (incluyendo usuarios) sincronizadas exitosamente.',
+                'tablas_sincronizadas' => $tablasProcesadas,
+                'virtualmin' => $resSync
+            ]);
         } catch (Exception $e) {
             echo json_encode([
                 'success' => false,
@@ -512,35 +674,65 @@ class SyncController {
     }
 
     /**
-     * Copia los registros de una tabla de catálogo origen a destino.
+     * Copia los registros de una tabla de catálogo o administrativa de origen a destino con protección transaccional.
      */
     private function replicarTablaCatalogo(PDO $dbOrigen, PDO $dbDestino, string $tabla): void {
         // Obtener registros de origen
         $stmtFetch = $dbOrigen->query("SELECT * FROM `$tabla`");
         $registros = $stmtFetch->fetchAll(PDO::FETCH_ASSOC);
 
-        // Desactivar temporalmente llaves foráneas en destino para vaciar e insertar
-        $dbDestino->exec("SET FOREIGN_KEY_CHECKS = 0;");
-        $dbDestino->exec("TRUNCATE TABLE `$tabla`;");
-
-        if (!empty($registros)) {
-            $columnas = array_keys($registros[0]);
-            $columnasEscapadas = array_map(fn($col) => "`$col`", $columnas);
-            $campos = implode(', ', $columnasEscapadas);
-            $placeholders = implode(', ', array_fill(0, count($columnas), '?'));
-
-            $sql = "INSERT INTO `$tabla` ($campos) VALUES ($placeholders)";
-            $stmtInsert = $dbDestino->prepare($sql);
-
-            foreach ($registros as $row) {
-                // Si la tabla es 'squemas', forzamos el valor del campo 'squema' a minúsculas
-                if ($tabla === 'squemas' && isset($row['squema'])) {
-                    $row['squema'] = strtolower($row['squema']);
+        // Protección especial para 'usuarios': Evitar dejar sin usuarios el sistema si Origen estuviera vacío y Destino tuviera registros
+        if (strtolower($tabla) === 'usuarios' && empty($registros)) {
+            try {
+                $stmtCheckDest = $dbDestino->query("SELECT COUNT(*) FROM `usuarios`");
+                if ((int)$stmtCheckDest->fetchColumn() > 0) {
+                    // Preservar usuarios existentes en destino
+                    return;
                 }
-                $stmtInsert->execute(array_values($row));
-            }
+            } catch (Exception $eCheck) {}
         }
-        $dbDestino->exec("SET FOREIGN_KEY_CHECKS = 1;");
+
+        $dbDestino->exec("SET FOREIGN_KEY_CHECKS = 0;");
+        $dbDestino->beginTransaction();
+
+        try {
+            $dbDestino->exec("TRUNCATE TABLE `$tabla`;");
+
+            if (!empty($registros)) {
+                $columnas = array_keys($registros[0]);
+                $columnasEscapadas = array_map(fn($col) => "`$col`", $columnas);
+                $campos = implode(', ', $columnasEscapadas);
+                $placeholders = implode(', ', array_fill(0, count($columnas), '?'));
+
+                $sql = "INSERT INTO `$tabla` ($campos) VALUES ($placeholders)";
+                $stmtInsert = $dbDestino->prepare($sql);
+
+                foreach ($registros as $row) {
+                    // Si la tabla es 'squemas', aseguramos la congruencia con el VPS
+                    if (strtolower($tabla) === 'squemas' && isset($row['squema'])) {
+                        $row['squema'] = strtolower($row['squema']);
+                    }
+                    $stmtInsert->execute(array_values($row));
+                }
+            }
+
+            // Verificación post-inserción para 'usuarios'
+            if (strtolower($tabla) === 'usuarios' && !empty($registros)) {
+                $stmtVerify = $dbDestino->query("SELECT COUNT(*) FROM `usuarios`");
+                if ((int)$stmtVerify->fetchColumn() === 0) {
+                    throw new Exception("La replicación de la tabla 'usuarios' resultó en 0 registros en destino.");
+                }
+            }
+
+            $dbDestino->commit();
+            $dbDestino->exec("SET FOREIGN_KEY_CHECKS = 1;");
+        } catch (Exception $e) {
+            if ($dbDestino->inTransaction()) {
+                $dbDestino->rollBack();
+            }
+            $dbDestino->exec("SET FOREIGN_KEY_CHECKS = 1;");
+            throw $e;
+        }
     }
 
     /**
@@ -650,6 +842,27 @@ class SyncController {
         try {
             $summary = SyncModel::getSyncRunsSummary();
             echo json_encode(['success' => true, 'data' => $summary]);
+        } catch (Exception $e) {
+            echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+        }
+    }
+
+    /**
+     * Re-evalúa y refresca el estado metadata de una base de datos individual en database_sync_jobs,
+     * actualizando database_sync_state y recalculando los contadores globales en database_sync_runs.
+     */
+    public function revalidarJobMetadata(): void {
+        header('Content-Type: application/json');
+        try {
+            $jobId = isset($_GET['job_id']) ? (int)$_GET['job_id'] : null;
+            $database = isset($_GET['database']) ? trim($_GET['database']) : null;
+
+            if (($jobId === null || $jobId <= 0) && empty($database)) {
+                throw new Exception("Se requiere el ID del job o el nombre de la base de datos.");
+            }
+
+            $res = SyncModel::revalidarJobMetadata($jobId, $database);
+            echo json_encode(['success' => true, 'data' => $res]);
         } catch (Exception $e) {
             echo json_encode(['success' => false, 'error' => $e->getMessage()]);
         }
