@@ -563,12 +563,30 @@ class SyncModel {
         $origenPdo = Database::getClienteConnection($dbName, 'origen');
         $currentMetadata = DatabaseMetadataService::getDatabaseMetadata($origenPdo, $dbName);
 
+        // Si no hay registro en sync_jobs o pctManual es 0, contar tablas físicas en destino
+        if (!$manualJob || $pctManual === 0) {
+            try {
+                $destinoPdo = Database::getClienteConnection($dbName, 'destino');
+                $stmtDestTab = $destinoPdo->query("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'");
+                $destTabCount = 0;
+                while ($rTab = $stmtDestTab->fetch(PDO::FETCH_NUM)) {
+                    if (!DatabaseMetadataService::isExcludedTable($rTab[0])) {
+                        $destTabCount++;
+                    }
+                }
+                $origTabCount = (int)($currentMetadata['table_count'] ?? 1);
+                if ($origTabCount > 0 && $destTabCount > 0) {
+                    $pctManual = min(100, (int)round(($destTabCount / $origTabCount) * 100));
+                }
+            } catch (Exception $exCount) {}
+        }
+
         // 4. Registrar sincronización exitosa en database_sync_state
         DatabaseMetadataService::recordSuccessfulSync($destino, $runId, $dbName, $currentMetadata);
 
         // 5. Construir razón de salto / detalle explicativo
-        $skipReason = "Validado manualmente";
-        if ($manualJob) {
+        $skipReason = "Validado por sync manual ({$pctManual}% completado)";
+        if ($manualJob && !empty($fechaManual)) {
             $skipReason = "Validado por sync manual ({$pctManual}% el {$fechaManual})";
         }
 

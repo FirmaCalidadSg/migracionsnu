@@ -448,7 +448,7 @@ class SyncController {
             if (Database::isServerGoneException($ex)) {
                 try {
                     $dbDestino = Database::getClienteConnection($schema, 'destino');
-                    $dbDestino->exec("SET SESSION max_allowed_packet = 1073741824;");
+                    try { $dbDestino->exec("SET GLOBAL max_allowed_packet = 1073741824;"); } catch (Throwable $eG) {}
                 } catch (Exception $exReconn) {}
 
                 $columnas = array_keys($registros[0]);
@@ -465,7 +465,7 @@ class SyncController {
                         if (Database::isServerGoneException($exRow)) {
                             try {
                                 $dbDestino = Database::getClienteConnection($schema, 'destino');
-                                $dbDestino->exec("SET SESSION max_allowed_packet = 1073741824;");
+                                try { $dbDestino->exec("SET GLOBAL max_allowed_packet = 1073741824;"); } catch (Throwable $eG) {}
                                 $stmtInsert = $dbDestino->prepare($sql);
                                 $stmtInsert->execute(array_values($row));
                             } catch (Exception $eFinal) {}
@@ -513,8 +513,8 @@ class SyncController {
             return;
         }
 
-        try { $dbOrigen->exec("SET SESSION max_allowed_packet = 1073741824;"); } catch (Exception $e) {}
-        try { $dbDestino->exec("SET SESSION max_allowed_packet = 1073741824;"); } catch (Exception $e) {}
+        try { $dbOrigen->exec("SET GLOBAL max_allowed_packet = 1073741824;"); } catch (Throwable $e) {}
+        try { $dbDestino->exec("SET GLOBAL max_allowed_packet = 1073741824;"); } catch (Throwable $e) {}
 
         // Verificar si la tabla existe en destino de forma ultra compatible
         try {

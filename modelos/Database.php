@@ -59,6 +59,9 @@ class Database {
 
         if ($key === 'destino') {
             $dbName = strtolower($dbName);
+            // Sanitizar espacios y caracteres no alfa-numéricos para Destino MariaDB
+            $dbName = preg_replace('/[^a-z0-9_]/', '_', $dbName);
+            $dbName = preg_replace('/_+/', '_', $dbName);
         }
 
         return $dbName;
@@ -166,13 +169,15 @@ class Database {
         try {
             $pdo = new PDO($dsn, $user, $pass, $options);
             
-            // Ampliar max_allowed_packet y timeouts en la sesión para evitar MySQL server has gone away (2006/1153)
+            // Ampliar max_allowed_packet y timeouts sin provocar Error 1621 (variable read-only en MariaDB)
             try {
-                $pdo->exec("SET SESSION max_allowed_packet = 1073741824;");
+                $pdo->exec("SET GLOBAL max_allowed_packet = 1073741824;");
+            } catch (Throwable $exPacket) {}
+            try {
                 $pdo->exec("SET SESSION net_read_timeout = 3600;");
                 $pdo->exec("SET SESSION net_write_timeout = 3600;");
                 $pdo->exec("SET SESSION wait_timeout = 28800;");
-            } catch (Exception $exOpt) {}
+            } catch (Throwable $exOpt) {}
 
             return $pdo;
         } catch (PDOException $e) {
@@ -184,9 +189,11 @@ class Database {
                     self::ensureClientDatabaseExists($schema, 'destino');
                     $pdo = new PDO($dsn, $user, $pass, $options);
                     try {
-                        $pdo->exec("SET SESSION max_allowed_packet = 1073741824;");
+                        $pdo->exec("SET GLOBAL max_allowed_packet = 1073741824;");
+                    } catch (Throwable $exOptG) {}
+                    try {
                         $pdo->exec("SET SESSION net_read_timeout = 3600;");
-                    } catch (Exception $exOpt) {}
+                    } catch (Throwable $exOpt) {}
                     return $pdo;
                 } catch (Exception $ex) {
                     throw new Exception("Error al conectar a la base de datos '$key' ($dbName@$host): " . $ex->getMessage(), (int)$e->getCode());
