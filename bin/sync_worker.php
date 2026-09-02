@@ -186,6 +186,9 @@ function runAutomaticSync(string $triggerType = 'cron'): array {
             $destinoPdo->exec("SET SQL_MODE = '';");
             try { $destinoPdo->exec("SET GLOBAL max_allowed_packet = 1073741824;"); } catch (Throwable $eG) {}
 
+            // Garantizar la creación de la estructura DDL de la tabla 'estadisticasUso' en destino sin migrar sus datos
+            DatabaseMetadataService::ensureExcludedTablesStructure($origenPdo, $destinoPdo);
+
             // 4. Sincronizar todas las tablas excluyendo 'estadisticasUso' y tablas de control del migrador
             $stmtTablas = $origenPdo->query("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'");
             $tablas = [];
@@ -288,6 +291,7 @@ function runAutomaticSync(string $triggerType = 'cron'): array {
                                     $sql = "INSERT INTO `$tabla` (" . implode(', ', $cols) . ") VALUES (" . implode(', ', array_fill(0, count($cols), '?')) . ")";
                                     $stmtIns = $destinoPdo->prepare($sql);
                                     foreach ($rowsData as $r) {
+                                        $r = sanitizarRegistroTextoWorker($r);
                                         if (strtolower($tabla) === 'squemas' && isset($r['squema'])) {
                                             $r['squema'] = strtolower($r['squema']);
                                         }
@@ -304,7 +308,7 @@ function runAutomaticSync(string $triggerType = 'cron'): array {
                                                 } catch (Exception $exFinal) {}
                                             }
                                         }
-                                    }                       }
+                                    }
                                 }
                             }
                             $offset += count($rowsData);
@@ -461,6 +465,25 @@ function runAutomaticSync(string $triggerType = 'cron'): array {
     ];
 }
 
+function sanitizarRegistroTextoWorker(array $row): array {
+    foreach ($row as $col => $val) {
+        if (is_string($val)) {
+            $val = str_replace("\0", "", $val);
+            if (!mb_check_encoding($val, 'UTF-8')) {
+                $val = mb_convert_encoding($val, 'UTF-8', 'ISO-8859-1, Windows-1252, UTF-8');
+            }
+            if (function_exists('iconv')) {
+                $clean = @iconv('UTF-8', 'UTF-8//IGNORE', $val);
+                if ($clean !== false) {
+                    $val = $clean;
+                }
+            }
+            $row[$col] = $val;
+        }
+    }
+    return $row;
+}
+
 function syncTableColumnsWorker(PDO $origenPdo, PDO $destinoPdo, string $tabla): void {
     try {
         $stmtColsOrig = $origenPdo->query("SHOW FULL COLUMNS FROM `$tabla`");
@@ -504,7 +527,6 @@ function syncTableColumnsWorker(PDO $origenPdo, PDO $destinoPdo, string $tabla):
             $destinoPdo->exec("SET FOREIGN_KEY_CHECKS = 0;");
             $destinoPdo->exec("DROP TABLE IF EXISTS `$tabla`;");
             $destinoPdo->exec($createSql);
-            $destinoPdo->exec("SET FOREIGN_KEY_CHECKS = 1;");
         } catch (Exception $exRecreate) {}
     }
 }

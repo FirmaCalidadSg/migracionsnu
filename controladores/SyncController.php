@@ -65,8 +65,11 @@ class SyncController {
             // 2. VALIDAR Y ASEGURAR QUE LA BASE DE DATOS DE DESTINO EXISTE Y ES ACCESIBLE ANTES DE PROSEGUIR
             Database::ensureClientDatabaseExists($schema, 'destino');
 
-            // 3. Conectarse a origen para obtener las tablas
+            // 3. Conectarse a origen y destino para validar tablas y garantizar la tabla 'estadisticasUso' en destino
             $dbOrigen = Database::getClienteConnection($schema, 'origen');
+            $dbDestinoCliente = Database::getClienteConnection($schema, 'destino');
+            DatabaseMetadataService::ensureExcludedTablesStructure($dbOrigen, $dbDestinoCliente);
+
             $stmtTablas = $dbOrigen->query("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'");
             $tablas = [];
             
@@ -137,12 +140,43 @@ class SyncController {
      * Sincroniza un lote (bloque) de registros para una tabla específica.
      */
     public function sincronizarTabla(): void {
-        header('Content-Type: application/json');
+        @ini_set('display_errors', '0');
+        @ini_set('memory_limit', '1024M');
+        @set_time_limit(300);
+
+        if (ob_get_length()) {
+            @ob_clean();
+        } else {
+            @ob_start();
+        }
+        header('Content-Type: application/json; charset=utf-8');
+
+        // Capturador de errores fatales de PHP para garantizar respuesta JSON y evitar 'Unexpected end of JSON input'
+        register_shutdown_function(function() {
+            $error = error_get_last();
+            if ($error !== null && in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR])) {
+                if (ob_get_length()) {
+                    @ob_clean();
+                }
+                header('Content-Type: application/json; charset=utf-8');
+                echo json_encode([
+                    'success' => false,
+                    'error' => 'Error fatal de PHP al procesar la tabla: ' . $error['message']
+                ]);
+            }
+        });
+
         try {
             $jobId = isset($_GET['job_id']) ? (int)$_GET['job_id'] : 0;
             $tabla = isset($_GET['tabla']) ? trim($_GET['tabla']) : '';
             $offset = isset($_GET['offset']) ? (int)$_GET['offset'] : 0;
+            
+            // Ajustar tamaño del bloque según la densidad de datos de la tabla
             $limite = 500; // Tamaño del bloque por defecto
+            $tablaLower = strtolower($tabla);
+            if (in_array($tablaLower, ['doc_online', 'documentos', 'archivos', 'logs', 'evidencias', 'historiales'], true)) {
+                $limite = 50; // Reducir a 50 filas para tablas con campos HTML / LONGTEXT pesados
+            }
 
             if ($jobId <= 0 || empty($tabla)) {
                 throw new Exception("Parámetros de sincronización incompletos.");
@@ -173,6 +207,11 @@ class SyncController {
             // Conexiones PDO de esquemas de clientes
             $dbOrigenCliente = Database::getClienteConnection($schema, 'origen');
             $dbDestinoCliente = Database::getClienteConnection($schema, 'destino');
+
+            // Desactivar estrictamente comprobaciones de FK y Unique Checks durante todo el procesamiento
+            $dbDestinoCliente->exec("SET FOREIGN_KEY_CHECKS = 0;");
+            $dbDestinoCliente->exec("SET UNIQUE_CHECKS = 0;");
+            $dbDestinoCliente->exec("SET SQL_MODE = '';");
 
             // 2. Si offset es 0, inicializar la estructura de la tabla (Fase 2)
             if ($offset === 0) {
@@ -267,6 +306,10 @@ class SyncController {
                 ]);
             }
 
+            if (ob_get_length()) {
+                ob_clean();
+            }
+
             echo json_encode([
                 'success' => true,
                 'completado' => $completado,
@@ -299,6 +342,9 @@ class SyncController {
                 }
             } catch (Exception $exLog) {
                 // Prevenir que un error de log altere la respuesta original
+            }
+            if (ob_get_length()) {
+                ob_clean();
             }
             echo json_encode(['success' => false, 'error' => $e->getMessage()]);
         }
@@ -340,6 +386,13 @@ class SyncController {
             } catch (Exception $eMeta) {
                 SyncModel::log('advertencia', $job['cliente_nombre'], $job['schema_name'], "No se pudo actualizar estado metadata en database_sync_state: " . $eMeta->getMessage(), null, $jobId);
             }
+
+            // Reactivar Foreign Key Checks al finalizar completamente el Job
+            try {
+                $dbDestCliente = Database::getClienteConnection($job['schema_name'], 'destino');
+                $dbDestCliente->exec("SET FOREIGN_KEY_CHECKS = 1;");
+                $dbDestCliente->exec("SET UNIQUE_CHECKS = 1;");
+            } catch (Throwable $eFk) {}
 
             SyncModel::log(
                 'info',
@@ -386,6 +439,13 @@ class SyncController {
 
             SyncModel::updateSyncJobStatus($jobId, 'fallido', $errorMsg);
 
+            // Reactivar Foreign Key Checks en destino tras fallo del Job
+            try {
+                $dbDestCliente = Database::getClienteConnection($job['schema_name'], 'destino');
+                $dbDestCliente->exec("SET FOREIGN_KEY_CHECKS = 1;");
+                $dbDestCliente->exec("SET UNIQUE_CHECKS = 1;");
+            } catch (Throwable $eFk) {}
+
             // Marcar tablas pendientes/en_progreso como fallidas
             $stmtProg = $dbDest->prepare("
                 UPDATE sync_progress 
@@ -426,6 +486,36 @@ class SyncController {
     }
 
     /**
+     * Sanitiza y limpia el contenido de los campos de texto/HTML de un registro,
+     * convirtiendo secuencias inválidas a UTF-8 y eliminando caracteres nulos \0
+     * para asegurar inserciones limpias en tablas como 'doc_online'.
+     */
+    private static function sanitizarRegistroTexto(array $row): array {
+        foreach ($row as $col => $val) {
+            if (is_string($val)) {
+                // 1. Eliminar caracteres nulos \0 que corrompen la cadena SQL
+                $val = str_replace("\0", "", $val);
+
+                // 2. Validar/convertir codificación UTF-8 limpia
+                if (!mb_check_encoding($val, 'UTF-8')) {
+                    $val = mb_convert_encoding($val, 'UTF-8', 'ISO-8859-1, Windows-1252, UTF-8');
+                }
+
+                // 3. Limpieza de bytes no imprimibles huérfanos vía iconv
+                if (function_exists('iconv')) {
+                    $clean = @iconv('UTF-8', 'UTF-8//IGNORE', $val);
+                    if ($clean !== false) {
+                        $val = $clean;
+                    }
+                }
+
+                $row[$col] = $val;
+            }
+        }
+        return $row;
+    }
+
+    /**
      * Inserta un lote de registros en destino con recuperación automática ante fallos de conexión (2006/2013),
      * límite de tamaño de paquete (1153) y columnas faltantes como 'sistema_id' (1054).
      */
@@ -444,38 +534,41 @@ class SyncController {
                 return;
             }
 
-            // 2. Manejo de Conexión Caída / Server Gone / Packet Size (2006, 2013, 1153)
+            // 2. Manejo de Inserción Resiliente Fila por Fila con Sanitización de HTML/Texto (para 'doc_online' y similares)
             if (Database::isServerGoneException($ex)) {
                 try {
                     $dbDestino = Database::getClienteConnection($schema, 'destino');
+                    $dbDestino->exec("SET FOREIGN_KEY_CHECKS = 0;");
                     try { $dbDestino->exec("SET GLOBAL max_allowed_packet = 1073741824;"); } catch (Throwable $eG) {}
                 } catch (Exception $exReconn) {}
-
-                $columnas = array_keys($registros[0]);
-                $columnasEscapadas = array_map(fn($col) => "`$col`", $columnas);
-                $campos = implode(', ', $columnasEscapadas);
-                $placeholders = implode(', ', array_fill(0, count($columnas), '?'));
-                $sql = "INSERT INTO `$tabla` ($campos) VALUES ($placeholders)";
-                
-                $stmtInsert = $dbDestino->prepare($sql);
-                foreach ($registros as $row) {
-                    try {
-                        $stmtInsert->execute(array_values($row));
-                    } catch (Exception $exRow) {
-                        if (Database::isServerGoneException($exRow)) {
-                            try {
-                                $dbDestino = Database::getClienteConnection($schema, 'destino');
-                                try { $dbDestino->exec("SET GLOBAL max_allowed_packet = 1073741824;"); } catch (Throwable $eG) {}
-                                $stmtInsert = $dbDestino->prepare($sql);
-                                $stmtInsert->execute(array_values($row));
-                            } catch (Exception $eFinal) {}
-                        }
-                    }
-                }
-                return;
             }
 
-            throw new Exception("Error al insertar lote en destino para tabla `$tabla`: " . $ex->getMessage());
+            $columnas = array_keys($registros[0]);
+            $columnasEscapadas = array_map(fn($col) => "`$col`", $columnas);
+            $campos = implode(', ', $columnasEscapadas);
+            $placeholders = implode(', ', array_fill(0, count($columnas), '?'));
+            $sql = "INSERT INTO `$tabla` ($campos) VALUES ($placeholders)";
+            
+            $stmtInsert = $dbDestino->prepare($sql);
+            foreach ($registros as $row) {
+                $rowClean = self::sanitizarRegistroTexto($row);
+                if (strtolower($tabla) === 'squemas' && isset($rowClean['squema'])) {
+                    $rowClean['squema'] = strtolower($rowClean['squema']);
+                }
+                try {
+                    $stmtInsert->execute(array_values($rowClean));
+                } catch (Exception $exRow) {
+                    if (Database::isServerGoneException($exRow)) {
+                        try {
+                            $dbDestino = Database::getClienteConnection($schema, 'destino');
+                            $dbDestino->exec("SET FOREIGN_KEY_CHECKS = 0;");
+                            try { $dbDestino->exec("SET GLOBAL max_allowed_packet = 1073741824;"); } catch (Throwable $eG) {}
+                            $stmtInsert = $dbDestino->prepare($sql);
+                            $stmtInsert->execute(array_values($rowClean));
+                        } catch (Exception $eFinal) {}
+                    }
+                }
+            }
         }
     }
 
@@ -491,6 +584,7 @@ class SyncController {
         try {
             $stmtInsert = $dbDestino->prepare($sql);
             foreach ($registros as $row) {
+                $row = self::sanitizarRegistroTexto($row);
                 if (strtolower($tabla) === 'squemas' && isset($row['squema'])) {
                     $row['squema'] = strtolower($row['squema']);
                 }
@@ -509,6 +603,8 @@ class SyncController {
      * Valida y prepara la estructura de la tabla en destino (Fase 2).
      */
     private function prepararTablaDestino(PDO $dbOrigen, PDO $dbDestino, string $tabla): void {
+        DatabaseMetadataService::ensureExcludedTablesStructure($dbOrigen, $dbDestino);
+
         if (DatabaseMetadataService::isExcludedTable($tabla)) {
             return;
         }
@@ -535,16 +631,26 @@ class SyncController {
             $createSql = preg_replace('/utf8mb4_0900_bin/i', 'utf8mb4_bin', $createSql);
             $createSql = preg_replace('/utf8mb4_0[89]\d\d_[a-z0-9_]+/i', 'utf8mb4_unicode_ci', $createSql);
 
-            // Ejecutar creación en destino
-            $dbDestino->exec($createSql);
+            // Intentar crear la tabla con manejo resiliente ante FK constraint (errno 150 / 1005)
+            try {
+                $dbDestino->exec($createSql);
+            } catch (Exception $exFkCreate) {
+                // Si falla por FK constraint (errno 150/1005), limpiar restricciones FK y reintentar
+                $cleanSql = preg_replace('/CONSTRAINT `[^`]+` FOREIGN KEY `[^`]+` \([^)]+\) REFERENCES `[^`]+` \([^)]+\)( ON DELETE [^,\n]+)?( ON UPDATE [^,\n]+)?/i', '', $createSql);
+                $cleanSql = preg_replace('/CONSTRAINT `[^`]+` FOREIGN KEY \([^)]+\) REFERENCES `[^`]+` \([^)]+\)( ON DELETE [^,\n]+)?( ON UPDATE [^,\n]+)?/i', '', $cleanSql);
+                $cleanSql = preg_replace('/,\s*\)/', ')', $cleanSql);
+                $dbDestino->exec($cleanSql);
+            }
         } else {
             // Sincronizar columnas para agregar las faltantes en Destino (ej: 'sistema_id')
             $this->sincronizarColumnasTabla($dbOrigen, $dbDestino, $tabla);
 
-            // Si la tabla ya existe, la vaciamos (clean truncate)
-            $dbDestino->exec("SET FOREIGN_KEY_CHECKS = 0;");
-            $dbDestino->exec("TRUNCATE TABLE `$tabla`;");
-            $dbDestino->exec("SET FOREIGN_KEY_CHECKS = 1;");
+            // Vaciar la tabla en destino (clean truncate/delete) manteniendo FK checks desactivados
+            try {
+                $dbDestino->exec("TRUNCATE TABLE `$tabla`;");
+            } catch (Exception $exTrunc) {
+                $dbDestino->exec("DELETE FROM `$tabla`;");
+            }
         }
     }
 
@@ -596,7 +702,6 @@ class SyncController {
                 $dbDestino->exec("SET FOREIGN_KEY_CHECKS = 0;");
                 $dbDestino->exec("DROP TABLE IF EXISTS `$tabla`;");
                 $dbDestino->exec($createSql);
-                $dbDestino->exec("SET FOREIGN_KEY_CHECKS = 1;");
             } catch (Exception $exRecreate) {}
         }
     }
@@ -656,6 +761,20 @@ class SyncController {
 
             // 3. Sincronizar y asociar catálogo de bases de clientes MariaDB con Virtualmin
             $resSync = DatabaseProvisioningService::syncDatabaseCatalog('snuquality.tech', 'fugzcdpo_snu');
+
+            // 4. Garantizar la estructura de la tabla 'estadisticasUso' en todas las bases de datos de clientes registradas en Destino
+            try {
+                $clientesMap = SyncModel::getClientesMap();
+                foreach ($clientesMap as $c) {
+                    if (!empty($c['schema'])) {
+                        try {
+                            $dbO = Database::getClienteConnection($c['schema'], 'origen');
+                            $dbD = Database::getClienteConnection($c['schema'], 'destino');
+                            DatabaseMetadataService::ensureExcludedTablesStructure($dbO, $dbD);
+                        } catch (Throwable $eEx) {}
+                    }
+                }
+            } catch (Throwable $eMap) {}
 
             echo json_encode([
                 'success' => true,

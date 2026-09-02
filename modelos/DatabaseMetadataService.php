@@ -22,6 +22,85 @@ class DatabaseMetadataService {
     }
 
     /**
+     * Garantiza que la estructura DDL de las tablas excluidas de migración de datos (como 'estadisticasUso')
+     * exista en la base de datos de destino mediante 'CREATE TABLE IF NOT EXISTS'.
+     * 
+     * REGLAS DE SEGURIDAD:
+     * 1. Únicamente crea la estructura DDL en la base de datos destino si no existe.
+     * 2. NUNCA migra ni traslada registros/datos desde el servidor de origen.
+     * 3. NUNCA elimina, trunca ni sobreescribe registros ya existentes en destino.
+     * 4. Mantiene la tabla excluida del cálculo de firmas metadata_signature y del conteo de migración.
+     *
+     * @param PDO $origenPdo Conexión a la base de datos del cliente en Origen
+     * @param PDO $destinoPdo Conexión a la base de datos del cliente en Destino
+     */
+    public static function ensureExcludedTablesStructure(PDO $origenPdo, PDO $destinoPdo): void {
+        foreach (self::EXCLUDED_TABLES as $tablaExcluidaLower) {
+            try {
+                // 1. Verificar si la tabla ya existe en Destino
+                try {
+                    $destinoPdo->query("SELECT 1 FROM `$tablaExcluidaLower` LIMIT 1");
+                    $tablaExisteDestino = true;
+                } catch (Throwable $exPrep) {
+                    $tablaExisteDestino = false;
+                }
+
+                if ($tablaExisteDestino) {
+                    continue; // Ya existe en destino; preservamos sus datos intactos sin modificar nada
+                }
+
+                // 2. Obtener el nombre exacto de la tabla en Origen (respetando casing de MariaDB)
+                $nombreTablaOrigen = null;
+                $stmtAll = $origenPdo->query("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'");
+                while ($row = $stmtAll->fetch(PDO::FETCH_NUM)) {
+                    if (strtolower($row[0]) === $tablaExcluidaLower) {
+                        $nombreTablaOrigen = $row[0];
+                        break;
+                    }
+                }
+
+                $createSql = null;
+                if ($nombreTablaOrigen !== null) {
+                    // Obtener la sentencia DDL exacta del Origen
+                    $stmtCreate = $origenPdo->query("SHOW CREATE TABLE `$nombreTablaOrigen`");
+                    $rowCreate = $stmtCreate->fetch(PDO::FETCH_ASSOC);
+                    if (!empty($rowCreate['Create Table'])) {
+                        $createSql = $rowCreate['Create Table'];
+                    }
+                }
+
+                // Fallback de DDL por defecto en caso de que Origen tampoco la tenga definida aún
+                if (empty($createSql) && $tablaExcluidaLower === 'estadisticasuso') {
+                    $createSql = "CREATE TABLE IF NOT EXISTS `estadisticasUso` (
+                        `id` INT AUTO_INCREMENT PRIMARY KEY,
+                        `evento` VARCHAR(255) NULL,
+                        `fecha` DATETIME DEFAULT CURRENT_TIMESTAMP
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;";
+                }
+
+                if (!empty($createSql)) {
+                    // Sanitizar colaciones incompatibles de MySQL 8.0 a MariaDB 10.x
+                    $createSql = preg_replace('/utf8mb4_0900_ai_ci/i', 'utf8mb4_unicode_ci', $createSql);
+                    $createSql = preg_replace('/utf8mb4_0900_bin/i', 'utf8mb4_bin', $createSql);
+                    $createSql = preg_replace('/utf8mb4_0[89]\d\d_[a-z0-9_]+/i', 'utf8mb4_unicode_ci', $createSql);
+
+                    // Ejecutar la creación de estructura en Destino sin tocar ni mover datos
+                    try {
+                        $destinoPdo->exec($createSql);
+                    } catch (Throwable $exFkCreate) {
+                        $cleanSql = preg_replace('/CONSTRAINT `[^`]+` FOREIGN KEY `[^`]+` \([^)]+\) REFERENCES `[^`]+` \([^)]+\)( ON DELETE [^,\n]+)?( ON UPDATE [^,\n]+)?/i', '', $createSql);
+                        $cleanSql = preg_replace('/CONSTRAINT `[^`]+` FOREIGN KEY \([^)]+\) REFERENCES `[^`]+` \([^)]+\)( ON DELETE [^,\n]+)?( ON UPDATE [^,\n]+)?/i', '', $cleanSql);
+                        $cleanSql = preg_replace('/,\s*\)/', ')', $cleanSql);
+                        $destinoPdo->exec($cleanSql);
+                    }
+                }
+            } catch (Throwable $e) {
+                // Capturar excepciones para no interrumpir el flujo del migrador
+            }
+        }
+    }
+
+    /**
      * Obtiene los metadatos y calcula la firma SHA-256 de una base de datos en el servidor de origen.
      * Excluye expresamente la tabla 'estadisticasUso'.
      *

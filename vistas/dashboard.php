@@ -1105,7 +1105,17 @@
                     document.getElementById('sync-table-name').innerText = `Migrando: ${tablaNombre}`;
 
                     fetch(`index.php?action=sincronizar_tabla&job_id=${jobId}&tabla=${tablaNombre}&offset=${offset}`)
-                        .then(response => response.json())
+                        .then(async response => {
+                            const rawText = await response.text();
+                            if (!rawText || rawText.trim() === '') {
+                                throw new Error(`El servidor devolvió una respuesta vacía al procesar la tabla \`${tablaNombre}\`.`);
+                            }
+                            try {
+                                return JSON.parse(rawText);
+                            } catch (eJson) {
+                                throw new Error(`Respuesta no válida del servidor: ${rawText.substring(0, 150)}`);
+                            }
+                        })
                         .then(res => {
                             if (!res.success) {
                                 reject(new Error(res.error || 'Error desconocido al migrar lote.'));

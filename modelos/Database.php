@@ -179,6 +179,14 @@ class Database {
                 $pdo->exec("SET SESSION wait_timeout = 28800;");
             } catch (Throwable $exOpt) {}
 
+            if ($key === 'destino' && $schema !== null) {
+                try {
+                    $pdo->exec("SET FOREIGN_KEY_CHECKS = 0;");
+                    $pdo->exec("SET UNIQUE_CHECKS = 0;");
+                    $pdo->exec("SET SQL_MODE = '';");
+                } catch (Throwable $exFk) {}
+            }
+
             return $pdo;
         } catch (PDOException $e) {
             $errorCode = (int)($e->errorInfo[1] ?? $e->getCode());
