@@ -278,7 +278,9 @@ function runAutomaticSync(string $triggerType = 'cron'): array {
                                     $msgB = strtolower($exBatch->getMessage());
                                     if (str_contains($msgB, 'unknown column') || str_contains($msgB, '1054')) {
                                         syncTableColumnsWorker($origenPdo, $destinoPdo, $tabla);
-                                                    if (Database::isServerGoneException($exBatch)) {
+                                    }
+
+                                    if (Database::isServerGoneException($exBatch)) {
                                         try {
                                             $destinoPdo = Database::getClienteConnection($dbName, 'destino');
                                             $destinoPdo->exec("SET FOREIGN_KEY_CHECKS = 0;");
